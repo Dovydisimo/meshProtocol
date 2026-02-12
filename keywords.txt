@@ -1,0 +1,64 @@
+#######################################
+# ESP-NOW Mesh Protocol Library
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+meshPacket_t            KEYWORD1
+meshPacketQueue_t       KEYWORD1
+meshPacketCache_t       KEYWORD1
+knownPeers_t            KEYWORD1
+routingTable_t          KEYWORD1
+PendingAck_t            KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+meshPacket_init                 KEYWORD2
+meshProtocol_addPeer            KEYWORD2
+meshProtocol_removePeer         KEYWORD2
+meshPacket_routeFind            KEYWORD2
+meshPacket_routeAdd             KEYWORD2
+meshPacket_routeAge             KEYWORD2
+meshPacket_rememberPacket       KEYWORD2
+meshPacket_isPacketSeen         KEYWORD2
+meshPacket_getActiveDeviceCount KEYWORD2
+meshPacket_markDelivered        KEYWORD2
+meshPacket_addPendingAck        KEYWORD2
+meshPacket_retransmitPacket     KEYWORD2
+meshPacket_sendMessage          KEYWORD2
+meshPacket_processPackets       KEYWORD2
+meshPacket_printRoutingTable    KEYWORD2
+meshPacket_handlePacketCallback KEYWORD2
+meshPacket_OnDataRecv           KEYWORD2
+meshPacket_OnDataSent           KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+MAX_PEERS                   LITERAL1
+MAXIMUM_PACKET_LENGTH       LITERAL1
+MESH_PACKET_MAX_ROUTES      LITERAL1
+MESH_PACKET_CACHE_SIZE      LITERAL1
+MESH_PACKET_HEADER_LENGTH   LITERAL1
+MESH_PACKET_HOP_LIMIT       LITERAL1
+MESH_PACKET_QUEUE_LENGTH    LITERAL1
+MESH_PACKET_PENDING_ACKS    LITERAL1
+MESH_PACKET_NODE_EXPIRE_TIME_MS LITERAL1
+
+MAX_IOT_DEVICES         LITERAL1
+DEVICE_ID_INTERNET_GATEWAY  LITERAL1
+DEVICE_ID_MPPT_CONTROLLER    LITERAL1
+DEVICE_ID_WATER_BOILER       LITERAL1
+DEVICE_ID_SAUNA_CONTROLLER   LITERAL1
+DEVICE_ID_MPPT_CONTROLLER_2  LITERAL1
+DEVICE_ID_DATABASE           LITERAL1
+DEVICE_ID_INVALID            LITERAL1
+DEVICE_ID_BROADCAST          LITERAL1
+
+PACKET_TYPE_TELEMETRY        LITERAL1
+PACKET_TYPE_CONTROL          LITERAL1
+PACKET_TYPE_NOTIFICATION     LITERAL1
+PACKET_TYPE_ACKNOWLEDGEMENT  LITERAL1
+PACKET_TYPE_BEACON           LITERAL1
