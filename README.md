@@ -26,7 +26,7 @@ This boils down to the following requirements:
   - [Process Packets](#2-process-packets)
   - [Handle Incoming Packets](#3-handle-incoming-packets)
   - [Sending a Message](#4-sending-a-message)
-- [License & Author](#licenseAuthor)
+- [License & Author](#license-&-author)
 - [TODO](#todo)
 ---
 
