@@ -21,15 +21,16 @@
 
 
         --- TODO ---
-  1. Perkelti biblioteką į normalia lokaciją su .c ir .h.
   2. Implementuoti beacon'ą kaimynui atradimui ir geresniam route discovery. RREQ / RREP 
   3. Peržiūrėti resursus, kuriuos dalinasi task'ai ir sudėti semhaphoras.
   5. Pabaigti implementaciją → checkRetransmissions().
   6. Pabaigti implementaciją → meshPacket_sendBeacon.
-  7. Add beerware license descriptor.
   8. Pridėti benchmark statistikas.
-  9. Pridėti visų peers spausdinimo funkciją.
-  10. 
+  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
+  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
+  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
+  13. 
+  
 */
 
 #ifndef meshProtocol_h
@@ -55,7 +56,9 @@
 #define MESH_PACKET_PENDING_ACKS          20     //- Maximum number of ACKs a device can hold at the same time. Maximum is 255.
 #define MESH_PACKET_NODE_EXPIRE_TIME_MS   900000 //- Timeout value for route
 
-#define MAX_IOT_DEVICES                   	128      //- Maximum is 255.
+#define MAX_IOT_DEVICES                   128    //- Maximum is 255.
+
+//----------------- DEVICES (CUSTOM) -----------------//
 #define DEVICE_ID_INTERNET_GATEWAY        	0
 #define DEVICE_ID_MPPT_CONTROLLER         	1
 #define DEVICE_ID_WATER_BOILER            	2
@@ -63,12 +66,15 @@
 #define DEVICE_ID_MPPT_CONTROLLER_2       	4
 #define DEVICE_ID_CLIMATE_LOGGER_0			5
 #define DEVICE_ID_CLIMATE_LOGGER_1			6
-//#define DEVICE_ID_WATER_BOILER_TEST    	  11	 //- TODO: IŠTRINTI PO TESTU.
-//----------------- SERVICE DEVICE IDs -----------------//
-#define DEVICE_ID_DATABASE                250
-#define DEVICE_ID_INVALID                 253
-#define DEVICE_ID_BROADCAST               254
 
+
+//----------------- SERVICE DEVICES -----------------//
+#define DEVICE_ID_DATABASE                250
+#define DEVICE_ID_BROADCAST               254
+#define DEVICE_ID_UNCONFIGURED            255	//- NOTE: Can also be used for beacon devices.
+
+
+//----------------- PACKET TYPES -----------------//
 #define PACKET_TYPE_TELEMETRY             0
 #define PACKET_TYPE_CONTROL               1
 #define PACKET_TYPE_NOTIFICATION          2
