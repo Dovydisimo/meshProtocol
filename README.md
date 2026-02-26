@@ -1,6 +1,4 @@
 # ESP-NOW Mesh Protocol Library
-**Dovydas Bružas** <Dovydisimo@gmail.com>
-
 
 ### TLDR;
 Lightweight and fast ESP-NOW (and more) mesh networking library for ESP32 devices.  
@@ -21,14 +19,14 @@ This boils down to the following requirements:
 
 ## Table of Contents
 - [Features](#features)
+- [How Does It Work](#How-Does-It-Work)
 - [Installation](#installation)
 - [Getting Started](#getting-started)
   - [Initialize the Mesh](#1-initialize-the-mesh)
   - [Process Packets](#2-process-packets)
   - [Handle Incoming Packets](#3-handle-incoming-packets)
   - [Sending a Message](#4-sending-a-message)
-- [API Reference](#api-reference)
-- [License](#license)
+- [License & Author](#licenseAuthor)
 - [TODO](#todo)
 ---
 
@@ -119,11 +117,12 @@ meshPacket_sendMessage(LOCAL_DEVICE_ID, DEVICE_ID_MPPT_CONTROLLER, PACKET_TYPE_C
 
 ---
 
-## License
+## License & Author
 
 MIT / Beerware.
 
-If you find this useful, buy the author a beer 🍺 :)
+If you find this useful, buy the author a beer 🍺 :) \
+**Dovydas Bružas, Lithuania** <Dovydisimo@gmail.com>
 
 ---
 
