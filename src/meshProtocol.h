@@ -4,16 +4,6 @@
                                             Released into the public domain.
 
 
-                                          --- IMPLEMENTATION INSTRUCTIONS ---
-      1. Place meshPacket_init(uint8_t wifiChannel) under the main() or setup() function. Set the channel to match a Wi-Fi channel.
-      2. Place void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDeviceCount) under loop() or a FreeRTOS task. 
-          2.1. NOTE: The pointer acceptedDeviceIDs sets the accepted device IDs, so packets can be filtered accordingly. Use ((uint8_t[]){LOCAL_DEVICE_ID}, 1) to accept only native device.
-          2.2. Note: FreeRTOS Queue API is used for local packet storage.
-      3. Place void meshPacket_handlePacketCallback(meshPacket_t *localPacket) in your main.c. By default the function is declared as week.
-          3.1. Use localPacket->packetType to check the packet type and handle it accordingly.
-      4. Profit
-
-
         --- LIMITATIONS ---
   1. CAUTION: Not confirmed to be thread-safe. 
   2. 
