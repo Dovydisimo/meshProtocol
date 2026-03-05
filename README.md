@@ -72,12 +72,12 @@ The above example shows how routes are built. Upon initial transmission a source
 Intermediate nodes (ex., Node 01) receive the broadcast packet. If the packet is not for them, they forward it. During this forwarding process, the reverse path: "to reach Sxx, forward via MAC" is opportunistically learned. This learned route is then stored.
 The intended recipient (D02) receives the packet, fires a callback and sends an ACK back to the source. This ACK also travels along a learned reverse path, reinforcing the direct connection.
 
-![screenshot](images/sendToNode.png.png) \
+![screenshot](images/sendToNode.png) \
 Once a route (or its reverse) is learned, Next time S00-D02-T01 packet is transmitted direct path is used, significantly improving efficiency. Additionally, using ESP-NOW packet re-transmission is handled 
 inside the library. The packet is resent for up to 10 times. 
 
 ### Mesh Hopping
-![screenshot](images/meshHopping.png.png) \
+![screenshot](images/meshHopping.png) \
 A mesh network woundn't be complete without hopping. The above example shows initial transmission with more nodes than in the previous example. By following logic described in **Route Discovery** section it can be seen
 how S00-D03 message is sent and ACK is received. This example is important to show to understand a few important points.
 
