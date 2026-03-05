@@ -85,8 +85,8 @@ Backward routes are learned based on "fastest win" meaning protocol doesn't opti
 
 ### Safety Mechanisms
 Since, a fallback transmisstion rely on broadcasting dublicate messages cannot be avoided in heavily packet areas. To manage this, the protocol stores a rotation `uniqueIdentifier` in each packet header. 
-When a device receives a packet, it checks the `uniqueIdentifier` and `sourceID`. If a match is found, the packet is dropped to prevent duplicates. Unique processed packets are remembered (table size is 25 entries).
-Additionally, the packet header includes a TTL (Time To Live), borrowed from the TCP/IP protocol. This parameter controls the maximum number of hops a packet can have. Each time the packet is routed, the TTL is decremented (default set to 5). This mechanism helps optimize route discovery and prevents potential routing loops.
+When a device receives a packet, it checks the `uniqueIdentifier` and `sourceID`. If a match is found, the packet is dropped to prevent duplicates. Unique processed packets are remembered (table size is 25 entries). \
+Additionally, the packet header includes a TTL (Time To Live), borrowed from the TCP/IP protocol. This parameter controls the maximum number of hops a packet can have. Each time the packet is routed, the TTL is decremented (default set to 5). This mechanism helps optimize route discovery and prevents potential routing loops. \
 To mitigate network saturation in heavily congested areas, flood control is implemented by introducing slight random delays before forwarding packets. Each packet experiences a delay of 1 to 5 milliseconds, reducing the chances of collision and/or broadcast storms.
 
 ### Route Aging
