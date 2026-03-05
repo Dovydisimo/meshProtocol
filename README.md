@@ -20,6 +20,10 @@ This boils down to the following requirements:
 ## Table of Contents
 - [Features](#features)
 - [How Does It Work](#How-Does-It-Work)
+  - [Route Discovery](#Route-Discovery)
+  - [Mesh Hopping](#Mesh-Hopping)
+  - [Safety Mechanisms](#Safety-Mechanisms)
+  - [Route Aging](#Route-Aging)
 - [Installation](#installation)
 - [Getting Started](#getting-started)
   - [Initialize the Mesh](#1-initialize-the-mesh)
@@ -31,7 +35,7 @@ This boils down to the following requirements:
 ---
 
 ## Features
-- Multi-hop routing via ESP-NOW
+- Multi-hop routing via ESP-NOW (default)
 - Automatic route aging and management
 - ACK-based delivery reliability
 - Duplicate packet suppression
@@ -42,7 +46,51 @@ This boils down to the following requirements:
 ---
 
 ## How Does It Work?
-ToDo
+Protocol piggy-backs on WiFi protocol and consists of the following header. 
+
+```
+struct __attribute__((packed)) meshPacket_t
+{
+  uint8_t sourceID;
+  uint8_t destinationID;
+  uint8_t packetType;
+  uint8_t payloadLength;
+  uint8_t TTL;
+  uint16_t uniqueIdentifier;
+  uint32_t reserved;
+  char payload[244];
+};
+```
+
+The whole header consist of 11 bytes, suitable for embedded systems like ESP32. The maximum payload size is 244 bytes. 
+
+### Route Discovery
+![screenshot](images/routeDiscovery.png) \
+Opportunistic route discovery mechanism is used. Devices learn routes simply by receiving packets, making the routing table management automatic and reactive.
+
+The above example shows how routes are built. Upon initial transmission a source node (S00) sends a packet to a destination (D02) for which it has no established route (no match in routing table), it fallbacks to broadcasts the packet to all its neighbors (FF:FF:FF:FF:FF:FF).
+Intermediate nodes (ex., Node 01) receive the broadcast packet. If the packet is not for them, they forward it. During this forwarding process, the reverse path: "to reach Sxx, forward via MAC" is opportunistically learned. This learned route is then stored.
+The intended recipient (D02) receives the packet, fires a callback and sends an ACK back to the source. This ACK also travels along a learned reverse path, reinforcing the direct connection.
+
+![screenshot](images/sendToNode.png.png) \
+Once a route (or its reverse) is learned, Next time S00-D02-T01 packet is transmitted direct path is used, significantly improving efficiency. Additionally, using ESP-NOW packet re-transmission is handled 
+inside the library. The packet is resent for up to 10 times. 
+
+### Mesh Hopping
+![screenshot](images/meshHopping.png.png) \
+A mesh network woundn't be complete without hopping. The above example shows initial transmission with more nodes than in the previous example. By following logic described in **Route Discovery** section it can be seen
+how S00-D03 message is sent and ACK is received. This example is important to show to understand a few important points.
+
+Backward routes are learned based on "fastest win" meaning protocol doesn't optimize the routes once they are established. 
+
+### Safety Mechanisms
+Since, a fallback transmisstion rely on broadcasting dublicate messages cannot be avoided in heavily packet areas. To manage this, the protocol stores a rotation `uniqueIdentifier` in each packet header. 
+When a device receives a packet, it checks the `uniqueIdentifier` and `sourceID`. If a match is found, the packet is dropped to prevent duplicates. Unique processed packets are remembered (table size is 25 entries).
+Additionally, the packet header includes a TTL (Time To Live), borrowed from the TCP/IP protocol. This parameter controls the maximum number of hops a packet can have. Each time the packet is routed, the TTL is decremented (default set to 5). This mechanism helps optimize route discovery and prevents potential routing loops.
+To mitigate network saturation in heavily congested areas, flood control is implemented by introducing slight random delays before forwarding packets. Each packet experiences a delay of 1 to 5 milliseconds, reducing the chances of collision and/or broadcast storms.
+
+### Route Aging
+To prevent stale nodes from sabotaging the network, route aging is used. Each device's routing table includes a `lastSeen` timestamp, which is updated every time a packet from a node is received. If no packets are received from a particular node for longer than the default duration of 10 minutes, that route is considered stale and is removed from the routing table.
 
 ---
 
