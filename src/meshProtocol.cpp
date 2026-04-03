@@ -68,7 +68,7 @@ esp_err_t meshPacket_init(uint8_t wifiChannel)
 esp_err_t meshProtocol_addPeer(const uint8_t *mac, uint8_t nodeID, uint8_t wifiChannel)
 {
   if(esp_now_is_peer_exist(mac)) return ESP_OK;
-  if(nodeID == DEVICE_ID_INVALID) return ESP_FAIL; //- Reject some IDs from being added as a peer.
+  if(nodeID == DEVICE_ID_UNCONFIGURED) return ESP_FAIL; //- Reject some IDs from being added as a peer.
 
   int idx = -1; 
   for(uint8_t i = 0; i < MAX_PEERS; i++)
