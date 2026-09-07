@@ -14,12 +14,13 @@
 #include "meshProtocol.h"
 
 
-//====================================== VARIABLES =============================================//
+//====================================== PRIVATE VARIABLES =============================================//
 uint8_t meshPacket_cacheIndex = 0;
 uint16_t meshPacket_messageCounter = 0;
 uint32_t meshPacket_deviceLastSeen[MAX_IOT_DEVICES];
 
 QueueHandle_t meshPacket_Queue;
+static SemaphoreHandle_t messageMutex = NULL;
 
 uint8_t meshPacket_broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -57,7 +58,13 @@ esp_err_t meshPacket_init(uint8_t wifiChannel)
   {
     return ESP_FAIL;
   }
-
+  
+  messageMutex = xSemaphoreCreateMutex();
+  if(messageMutex == NULL)
+  {
+    return ESP_FAIL;
+  }
+  
   //- NOTE: Register callbacks after queue in case a packet arrives before the queue exists.
   esp_now_register_send_cb(esp_now_send_cb_t(meshPacket_OnDataSent)); //- Register Send callback to get the status of trasnmitted packet.
   esp_now_register_recv_cb(esp_now_recv_cb_t(meshPacket_OnDataRecv)); //- Register callback to get received packet info.
@@ -171,7 +178,7 @@ void meshPacket_routeAge()
       routingTable[i].inUse = false; //- Mark as expired.
 
       #ifdef ENABLE_DEBUG_MESSAGES
-      Serial.printf("[MESH][INFO]: Route for D%02d expired\n", routingTable[i].destinationID);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Route for D%02d expired\n", routingTable[i].destinationID);
       #endif
     }
   }
@@ -220,7 +227,7 @@ void meshPacket_markDelivered(uint16_t uniqueID, uint8_t fromNode)
     if(pending[i].uniqueID == uniqueID && pending[i].destID == fromNode)
     {
       #ifdef ENABLE_DEBUG_MESSAGES
-      Serial.printf("[MESH][INFO]: ACK received from S%02u\n", fromNode);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: ACK received from S%02u\n", fromNode);
       #endif
 
       memset(&pending[i], 0, sizeof(PendingAck_t)); //- Clear slot.
@@ -274,7 +281,7 @@ void checkRetransmissions()
 
     if((now - pending[i].lastSend > 100) && (pending[i].retries < 3))
     {
-      Serial.printf("Retrying message %u to node %u (attempt %u)\n", pending[i].uniqueID, pending[i].destID, pending[i].retries + 1);
+      meshPacket_sendTerminalMessage("Retrying message %u to node %u (attempt %u)\n", pending[i].uniqueID, pending[i].destID, pending[i].retries + 1);
 
       //meshPacket_retransmitPacket(meshPacket_t *localPacket)
       esp_now_send(meshPacket_broadcastAddress, (uint8_t *)&pending[i].packet, pending[i].packet.payloadLength + MESH_PACKET_HEADER_LENGTH);
@@ -285,21 +292,10 @@ void checkRetransmissions()
   }
 }*/
 
-/*esp_err_t meshPacket_sendBeacon(uint8_t sourceID) //- ToDo: just for testing. It can be simplified by using meshPacket_sendMessage().
+esp_err_t meshPacket_sendBeacon(uint8_t sourceID)
 {
-  meshPacket_t beaconPacket;
-  beaconPacket.sourceID = sourceID;
-  beaconPacket.destinationID = DEVICE_ID_BROADCAST;
-  beaconPacket.packetType = PACKET_TYPE_BEACON;
-  beaconPacket.payloadLength = 6;
-  beaconPacket.TTL = MESH_PACKET_HOP_LIMIT; 
-  beaconPacket.uniqueIdentifier = __atomic_fetch_add(&meshPacket_messageCounter, 1, __ATOMIC_RELAXED); //- Atomic increment of 16-bit counter (safe across ISRs/tasks).
-  memcpy(beaconPacket.payload, (uint8_t *)"BEACON", beaconPacket.payloadLength);
-
-  //- Remember mesh packet, so it could be ignored immidiately.
-  meshPacket_rememberPacket(beaconPacket.sourceID, beaconPacket.uniqueIdentifier);
-  return esp_now_send(meshPacket_broadcastAddress, (uint8_t*)&beaconPacket, beaconPacket.payloadLength + MESH_PACKET_HEADER_LENGTH); 
-}*/
+  return meshPacket_sendMessage(sourceID, DEVICE_ID_BROADCAST, PACKET_TYPE_BEACON, (uint8_t *)"BEACON", 6, false, -1);
+}
 
 void meshPacket_retransmitPacket(meshPacket_t *localPacket, const uint8_t *MAC)
 {
@@ -348,8 +344,8 @@ esp_err_t meshPacket_sendMessage(uint8_t sourceID, uint8_t destinationID, uint8_
 
   //- Log details, including MAC.
   #ifdef ENABLE_DEBUG_MESSAGES
-  Serial.printf("[MESH][INFO]: Sending packet S%02d, D%02d, T%02d, L%02d, UID%05d\n", sourceID, destinationID, packetType, payloadLength, sendPacket.uniqueIdentifier);
-  Serial.printf("[MESH][INFO]: First hop D%02d / MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", (idx >= 0) ? routingTable[idx].destinationID : DEVICE_ID_BROADCAST, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  meshPacket_sendTerminalMessage("[MESH][INFO]: Sending packet S%02d, D%02d, T%02d, L%02d, UID%05d\n", sourceID, destinationID, packetType, payloadLength, sendPacket.uniqueIdentifier);
+  meshPacket_sendTerminalMessage("[MESH][INFO]: First hop D%02d / MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", (idx >= 0) ? routingTable[idx].destinationID : DEVICE_ID_BROADCAST, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   #endif
 
   return esp_now_send(mac, (const uint8_t*)&sendPacket, payloadLength + MESH_PACKET_HEADER_LENGTH);
@@ -361,8 +357,8 @@ void meshPacket_OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status
   {
     if(deviceTelemetry[i].device_MACaddr[0] == mac_addr[0] && deviceTelemetry[i].device_MACaddr[1] == mac_addr[1] && deviceTelemetry[i].device_MACaddr[2] == mac_addr[2] && deviceTelemetry[i].device_MACaddr[3] == mac_addr[3] && deviceTelemetry[i].device_MACaddr[4] == mac_addr[4] && deviceTelemetry[i].device_MACaddr[5] == mac_addr[5])
     {
-      Serial.printf("[ESP-NOW][INFO]: %s control packet sent", deviceTelemetry[i].deviceName);
-      Serial.println(status == ESP_NOW_SEND_SUCCESS ? " SUCCESFULLY!" : " UNSUCCESFULLY!");
+      meshPacket_sendTerminalMessage("[ESP-NOW][INFO]: %s control packet sent", deviceTelemetry[i].deviceName);
+      meshPacket_sendTerminalMessage(status == ESP_NOW_SEND_SUCCESS ? " SUCCESFULLY!" : " UNSUCCESFULLY!");
 
       if(status != ESP_NOW_SEND_SUCCESS) setError(ERROR_COMM_FAILURE);
     }
@@ -384,7 +380,7 @@ void meshPacket_OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_
   if(xQueueSend(meshPacket_Queue, &tmpPacket, 0) != pdTRUE) //- Push to queue.
   {
     //- ToDo: Implemented error flag, statistics.
-    Serial.printf("[MESH][ERROR]: Queue is FULL. Packet dropped!\n");
+    meshPacket_sendTerminalMessage("[MESH][ERROR]: Queue is FULL. Packet dropped!\n");
   }
 }
 
@@ -407,7 +403,7 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
     meshPacket_rememberPacket(localPacket->sourceID, localPacket->uniqueIdentifier);
 
     #ifdef ENABLE_DEBUG_MESSAGES
-    Serial.printf("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, RSSI: %ddBm\n", localPacket->sourceID, localPacket->destinationID, localPacket->packetType, localPacket->payloadLength, localPacket->uniqueIdentifier, localQueuePacket.RSSI);
+    meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, RSSI: %ddBm\n", localPacket->sourceID, localPacket->destinationID, localPacket->packetType, localPacket->payloadLength, localPacket->uniqueIdentifier, localQueuePacket.RSSI);
     #endif
 
     //- Accept if destinationID matches any in acceptedDeviceIDs OR is broadcast (0xFF).
@@ -445,7 +441,7 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
       meshPacket_routeAdd(localPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI);
 
       #ifdef ENABLE_DEBUG_MESSAGES
-      Serial.printf("[MESH][INFO]: New route to D%02d\n", localPacket->sourceID);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d\n", localPacket->sourceID);
       #endif
     }
     
@@ -457,8 +453,8 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
 
       //- Log details, including MAC.
       #ifdef ENABLE_DEBUG_MESSAGES
-      Serial.printf("[MESH][INFO]: Packet S%02d, D%02d, T%02d, L%02d, UID%05d\n", localPacket->sourceID, localPacket->destinationID, localPacket->packetType, localPacket->payloadLength, localPacket->uniqueIdentifier);
-      Serial.printf("[MESH][INFO]: Routed to D%02d / MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", (idx >= 0) ? routingTable[idx].destinationID : DEVICE_ID_BROADCAST, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Packet S%02d, D%02d, T%02d, L%02d, UID%05d\n", localPacket->sourceID, localPacket->destinationID, localPacket->packetType, localPacket->payloadLength, localPacket->uniqueIdentifier);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Routed to D%02d / MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", (idx >= 0) ? routingTable[idx].destinationID : DEVICE_ID_BROADCAST, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       #endif
 
       meshPacket_retransmitPacket(localPacket, mac);
@@ -468,7 +464,7 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
     if(meshPacket_packetProcessed && localPacket->packetType != PACKET_TYPE_ACKNOWLEDGEMENT)
     {
       #ifdef ENABLE_DEBUG_MESSAGES
-      Serial.printf("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", localPacket->destinationID, localPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, localPacket->uniqueIdentifier);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", localPacket->destinationID, localPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, localPacket->uniqueIdentifier);
       #endif
 
       //- Send acknowledgement.
@@ -481,18 +477,39 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
   //checkRetransmissions(); //- ToDo: Move to a better place?
 }
 
+void meshPacket_sendTerminalMessage(const char *format, ...)
+{
+  char buffer[128];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  if(xSemaphoreTake(messageMutex, pdMS_TO_TICKS(10)) == pdTRUE) //- portMAX_DELAY
+  {
+    meshPacket_messageHandler(buffer);
+    xSemaphoreGive(messageMutex);
+  }
+}
+
+/*__attribute__((weak)) void meshPacket_messageHandler(const char *message)
+{
+	Serial.print(message);
+}*/
+
 //====================================== HELPER FUNCTIONS =============================================//
 void meshPacket_printRoutingTable() 
 {
-  Serial.println("\n========================== Routing Table ==========================");
-  Serial.println("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) |");
-  Serial.println("----|--------|-------------------|-------------|-------|------------|");
+  meshPacket_sendTerminalMessage("\n========================== Routing Table ==========================");
+  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) |");
+  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|");
 
   for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES; i++) 
   {
     if(routingTable[i].inUse) 
     {
-      Serial.printf("%3d | %6d | %02X:%02X:%02X:%02X:%02X:%02X | %11lu | %-5s | %12d |\n",
+      meshPacket_sendTerminalMessage("%3d | %6d | %02X:%02X:%02X:%02X:%02X:%02X | %11lu | %-5s | %12d |\n",
         i,
         routingTable[i].destinationID,
         routingTable[i].nextHopMAC[0], routingTable[i].nextHopMAC[1], routingTable[i].nextHopMAC[2],
@@ -502,5 +519,5 @@ void meshPacket_printRoutingTable()
         routingTable[i].lastRSSI);
     }
   }
-  Serial.println("===================================================================\n");
+  meshPacket_sendTerminalMessage("===================================================================\n");
 }

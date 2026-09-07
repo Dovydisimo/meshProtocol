@@ -4,22 +4,21 @@
                                             Released into the public domain.
 
 
-        --- LIMITATIONS ---
-  1. CAUTION: Not confirmed to be thread-safe. 
-  2. 
-  3. 
+			--- LIMITATIONS ---
+	  1. CAUTION: Not confirmed to be thread-safe. 
+	  2. 
+	  3. 
 
 
-        --- TODO ---
-  2. Implementuoti beacon'ą kaimynui atradimui ir geresniam route discovery. RREQ / RREP 
-  3. Peržiūrėti resursus, kuriuos dalinasi task'ai ir sudėti semhaphoras.
-  5. Pabaigti implementaciją → checkRetransmissions().
-  6. Pabaigti implementaciją → meshPacket_sendBeacon.
-  8. Pridėti benchmark statistikas.
-  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
-  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
-  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
-  13. 
+			--- TODO ---
+	  3. Peržiūrėti resursus, kuriuos dalinasi task'ai ir sudėti semhaphoras.
+	  5. Pabaigti implementaciją → checkRetransmissions().
+	  8. Pridėti benchmark statistikas.
+	  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
+	  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
+	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
+	  13. Atnaujinti readme.md pridedant meshPacket_messageHandler() implementaciją.
+	  14. 
   
 */
 
@@ -39,8 +38,8 @@
 #define MAXIMUM_PACKET_LENGTH	          250    //- Limited by ESP-NOW maximum packet size.
 
 #define MESH_PACKET_MAX_ROUTES            30     //- Maximum number of routes a device can hold. Maximum is 255.
-#define MESH_PACKET_CACHE_SIZE            25     //- Number of mesh packets system remembers. Maximum is 255.
-#define MESH_PACKET_HEADER_LENGTH         11     //- 
+#define MESH_PACKET_CACHE_SIZE            25     //- Number of mesh packets device remembers. Maximum is 255.
+#define MESH_PACKET_HEADER_LENGTH         11     //- Driven by meshPacket_t structure.
 #define MESH_PACKET_HOP_LIMIT             5      //- 5-hop limit. Maximum is 255.
 #define MESH_PACKET_QUEUE_LENGTH          36     //- Queue length to store meshPackets.
 #define MESH_PACKET_PENDING_ACKS          20     //- Maximum number of ACKs a device can hold at the same time. Maximum is 255.
@@ -104,7 +103,6 @@ struct __attribute__((packed)) knownPeers_t
   bool inUse;
   uint8_t nodeID;
   uint8_t MAC[6];
-
 };
 
 struct __attribute__((packed)) routingTable_t
@@ -114,7 +112,6 @@ struct __attribute__((packed)) routingTable_t
     uint8_t nextHopMAC[6];      //- MAC of the next hop.
     uint32_t lastSeen;          //- millis() timestamp for aging.
     int8_t lastRSSI;
-
 };
 
 struct __attribute__((packed)) PendingAck_t
@@ -125,7 +122,6 @@ struct __attribute__((packed)) PendingAck_t
   unsigned long lastSend;
   meshPacket_t packet;
 };
-
 
 //========================================= FUNCTION PROTOTYPES ==============================================//
 esp_err_t meshPacket_init(uint8_t wifiChannel);
@@ -140,10 +136,13 @@ uint8_t meshPacket_getActiveDeviceCount(uint32_t lastSeenDeviceThreshold_ms);
 void meshPacket_markDelivered(uint16_t uniqueID, uint8_t fromNode);
 void meshPacket_addPendingAck(uint16_t uniqueID, uint8_t destID, meshPacket_t *packet);
 void meshPacket_retransmitPacket(meshPacket_t *localPacket, const uint8_t *MAC);
+esp_err_t meshPacket_sendBeacon(uint8_t sourceID);
 esp_err_t meshPacket_sendMessage(uint8_t sourceID, uint8_t destinationID, uint8_t packetType, const uint8_t *payload, uint8_t payloadLength, bool loopback = false, int32_t forceUID = -1);
 void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDeviceCount, uint32_t waitTime_ms);
 void meshPacket_printRoutingTable();
+void meshPacket_sendTerminalMessage(const char *format, ...);
 
+void meshPacket_messageHandler(const char *message);
 void meshPacket_handlePacketCallback(meshPacket_t *localPacket) __attribute__((weak));
 void meshPacket_OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
 void meshPacket_OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -153,7 +152,7 @@ void meshPacket_OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status
 
 //========================================= VALIDATION CHECKS ==============================================//
 static_assert(MESH_PACKET_HEADER_LENGTH == offsetof(meshPacket_t, payload), "ERROR: meshPacket_t header length mismatch!");
-
+void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 
 
@@ -223,6 +222,20 @@ static_assert(MESH_PACKET_HEADER_LENGTH == offsetof(meshPacket_t, payload), "ERR
                     --- v1.6 ---
 	  1. CHORE: library migrated from .ino file to proper library folder (.h, .cpp). No functional changes.
 	  2. 
+	  
+				---	2026-03-16	---
+				  --- v1.6.1 ---
+				  
+	  1. FIX: Macro DEVICE_ID_INVALID was accidently deleted. It was replaced with DEVICE_ID_UNCONFIGURED.
+	  2. 
+	  
+	  			---	2026-09-04	---
+				  --- v1.7.0 ---
+				  
+	  1. FEATURE: Flood beacon introduced handled by meshPacket_sendBeacon(...) function for better route discovery (RREQ - Route Request / RREP - Route Reply).
+	  2. CHORE: Minor code maintenance (no functional changes).
+	  3. FEATURE: Users can define their own meshPacket_messageHandler(...) callback to control how messages are output (Serial, terminal, or custom destinations).
+	  4. 
 */
 
 
