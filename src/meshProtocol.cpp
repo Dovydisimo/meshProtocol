@@ -156,7 +156,7 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
       }
     }
   }
-  if(idx < 0) return ESP_FAIL; //- Return when no route is found AND table is full.
+  if(idx < 0) return ESP_FAIL; //- Return when no route is found or table is full.
 
   routingTable[idx].inUse = true;
   routingTable[idx].destinationID = destID;
@@ -283,7 +283,7 @@ void checkRetransmissions()
     {
       meshPacket_sendTerminalMessage("Retrying message %u to node %u (attempt %u)\n", pending[i].uniqueID, pending[i].destID, pending[i].retries + 1);
 
-      //meshPacket_retransmitPacket(meshPacket_t *localPacket)
+      //meshPacket_retransmitPacket(meshPacket_t *receivedPacket)
       esp_now_send(meshPacket_broadcastAddress, (uint8_t *)&pending[i].packet, pending[i].packet.payloadLength + MESH_PACKET_HEADER_LENGTH);
 
       pending[i].retries++;
@@ -297,13 +297,13 @@ esp_err_t meshPacket_sendBeacon(uint8_t sourceID)
   return meshPacket_sendMessage(sourceID, DEVICE_ID_BROADCAST, PACKET_TYPE_BEACON, (uint8_t *)"BEACON", 6, false, -1);
 }
 
-void meshPacket_retransmitPacket(meshPacket_t *localPacket, const uint8_t *MAC)
+void meshPacket_retransmitPacket(meshPacket_t *receivedPacket, const uint8_t *MAC)
 {
-  if(localPacket->TTL > 0) //- Forward only if TTL > 0.
+  if(receivedPacket->TTL > 0) //- Forward only if TTL > 0.
   {
-    localPacket->TTL--; //- Decrement TTL before sending.
+    receivedPacket->TTL--; //- Decrement TTL before sending.
     vTaskDelay(pdMS_TO_TICKS((esp_random() % 5) + 1)); //- Slight delay to avoid saturating network.
-    esp_now_send(MAC, (uint8_t *)localPacket, localPacket->payloadLength + MESH_PACKET_HEADER_LENGTH);
+    esp_now_send(MAC, (uint8_t *)receivedPacket, receivedPacket->payloadLength + MESH_PACKET_HEADER_LENGTH);
   }
 }
 
@@ -388,87 +388,89 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
 {
   if(acceptedDeviceIDs == NULL) return;
 
-  //- Update routing table, drop stale routings entries.
+  //- Update routing table, drop stale routing entries.
   meshPacket_routeAge();
 
   meshPacketQueue_t localQueuePacket;
   while(xQueueReceive(meshPacket_Queue, &localQueuePacket, pdMS_TO_TICKS(waitTime_ms)) == pdTRUE) //- waitTime_ms to prevent xQueueReceive() hammering in a tight spins (no delay, no blocking).
   {
-    meshPacket_t *localPacket = &localQueuePacket.queuePacket;
+    meshPacket_t *receivedPacket = &localQueuePacket.queuePacket;
 
     //- Drop mesh packet if already seen.
-    if(meshPacket_isPacketSeen(localPacket->sourceID, localPacket->uniqueIdentifier)) continue;
+    if(meshPacket_isPacketSeen(receivedPacket->sourceID, receivedPacket->uniqueIdentifier)) continue;
 
     //- Remember mesh packet.
-    meshPacket_rememberPacket(localPacket->sourceID, localPacket->uniqueIdentifier);
+    meshPacket_rememberPacket(receivedPacket->sourceID, receivedPacket->uniqueIdentifier);
 
     #ifdef ENABLE_DEBUG_MESSAGES
-    meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, RSSI: %ddBm\n", localPacket->sourceID, localPacket->destinationID, localPacket->packetType, localPacket->payloadLength, localPacket->uniqueIdentifier, localQueuePacket.RSSI);
+    meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, RSSI: %ddBm\n", receivedPacket->sourceID, receivedPacket->destinationID, receivedPacket->packetType, receivedPacket->payloadLength, receivedPacket->uniqueIdentifier, localQueuePacket.RSSI);
     #endif
 
     //- Accept if destinationID matches any in acceptedDeviceIDs OR is broadcast (0xFF).
     volatile bool meshPacket_packetProcessed = false;
     for(uint8_t i = 0; i < acceptedDeviceCount; i++)
     {
-      if(localPacket->destinationID == acceptedDeviceIDs[i] || localPacket->destinationID == DEVICE_ID_BROADCAST)
+      if(receivedPacket->destinationID == acceptedDeviceIDs[i] || receivedPacket->destinationID == DEVICE_ID_BROADCAST)
       {
         meshPacket_packetProcessed = true;
         
         //- ACK for me, mark delivered.
-        if(localPacket->packetType == PACKET_TYPE_ACKNOWLEDGEMENT)
+        if(receivedPacket->packetType == PACKET_TYPE_ACKNOWLEDGEMENT)
         {
-          meshPacket_markDelivered(localPacket->uniqueIdentifier, localPacket->sourceID);
+          meshPacket_markDelivered(receivedPacket->uniqueIdentifier, receivedPacket->sourceID);
           break;
         }
 
         if(meshPacket_handlePacketCallback != NULL)
         {
-          meshPacket_handlePacketCallback(localPacket);
+          meshPacket_handlePacketCallback(receivedPacket);
           break;
         }
       }
     }
     
     //- Learn reverse route: "to reach S, forward via MAC"
-    int index = meshPacket_routeFind(localPacket->sourceID);
-    if(index >= 0) 
+    int index = meshPacket_routeFind(receivedPacket->sourceID);
+    if(index >= 0) //- Update metadata if route already exist.
     {
       routingTable[index].lastSeen = millis(); //- Update timestamp.
       routingTable[index].lastRSSI = localQueuePacket.RSSI; //- Update RSSI.
     }
     else
     {
-      meshPacket_routeAdd(localPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI);
+      meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI);
 
       #ifdef ENABLE_DEBUG_MESSAGES
-      meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d\n", localPacket->sourceID);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d\n", receivedPacket->sourceID);
       #endif
     }
     
     //- Packet wasn't meant for me, let's route it.
     if(!meshPacket_packetProcessed)
     { 
-      int idx = meshPacket_routeFind(localPacket->destinationID);
+      int idx = meshPacket_routeFind(receivedPacket->destinationID);
       const uint8_t *mac = (idx >= 0) ? routingTable[idx].nextHopMAC : meshPacket_broadcastAddress;
 
       //- Log details, including MAC.
       #ifdef ENABLE_DEBUG_MESSAGES
-      meshPacket_sendTerminalMessage("[MESH][INFO]: Packet S%02d, D%02d, T%02d, L%02d, UID%05d\n", localPacket->sourceID, localPacket->destinationID, localPacket->packetType, localPacket->payloadLength, localPacket->uniqueIdentifier);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Packet S%02d, D%02d, T%02d, L%02d, UID%05d\n", receivedPacket->sourceID, receivedPacket->destinationID, receivedPacket->packetType, receivedPacket->payloadLength, receivedPacket->uniqueIdentifier);
       meshPacket_sendTerminalMessage("[MESH][INFO]: Routed to D%02d / MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", (idx >= 0) ? routingTable[idx].destinationID : DEVICE_ID_BROADCAST, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       #endif
 
-      meshPacket_retransmitPacket(localPacket, mac);
+      meshPacket_retransmitPacket(receivedPacket, mac);
     }
 
     //- Packet was meant for me, let's return ACK.
-    if(meshPacket_packetProcessed && localPacket->packetType != PACKET_TYPE_ACKNOWLEDGEMENT)
+    if(meshPacket_packetProcessed && receivedPacket->packetType != PACKET_TYPE_ACKNOWLEDGEMENT)
     {
       #ifdef ENABLE_DEBUG_MESSAGES
-      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", localPacket->destinationID, localPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, localPacket->uniqueIdentifier);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", receivedPacket->destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, receivedPacket->uniqueIdentifier);
       #endif
 
-      //- Send acknowledgement.
-      meshPacket_sendMessage(localPacket->destinationID, localPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, NULL, 0, false, localPacket->uniqueIdentifier);
+      //- Send acknowledgement. 
+	  //- LIMITATION: Beacon responses do not support multiple acceptedDeviceIDs[0] and only use first entry as sourceID.
+	  uint8_t destinationID = receivedPacket->packetType == PACKET_TYPE_BEACON ? acceptedDeviceIDs[0] : receivedPacket->destinationID;
+      meshPacket_sendMessage(destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, NULL, 0, false, receivedPacket->uniqueIdentifier);
     }
 
     //- ToDo: Pridėti atskirą BROADCAST persiuntimą.
@@ -493,17 +495,17 @@ void meshPacket_sendTerminalMessage(const char *format, ...)
   }
 }
 
-/*__attribute__((weak)) void meshPacket_messageHandler(const char *message)
+__attribute__((weak)) void meshPacket_messageHandler(const char *message)
 {
-	Serial.print(message);
-}*/
+//	Serial.print(message);
+}
 
 //====================================== HELPER FUNCTIONS =============================================//
 void meshPacket_printRoutingTable() 
 {
-  meshPacket_sendTerminalMessage("\n========================== Routing Table ==========================");
-  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) |");
-  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|");
+  meshPacket_sendTerminalMessage("\n========================== Routing Table ==========================\n");
+  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) |\n");
+  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|\n");
 
   for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES; i++) 
   {

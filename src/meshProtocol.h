@@ -6,7 +6,7 @@
 
 			--- LIMITATIONS ---
 	  1. CAUTION: Not confirmed to be thread-safe. 
-	  2. 
+	  2. LIMITATION: Beacon responses do not support multiple acceptedDeviceIDs[0] and only use first entry as sourceID.
 	  3. 
 
 
@@ -17,8 +17,6 @@
 	  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
 	  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
 	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
-	  13. Atnaujinti readme.md pridedant meshPacket_messageHandler() implementaciją.
-	  14. 
   
 */
 
@@ -43,7 +41,7 @@
 #define MESH_PACKET_HOP_LIMIT             5      //- 5-hop limit. Maximum is 255.
 #define MESH_PACKET_QUEUE_LENGTH          36     //- Queue length to store meshPackets.
 #define MESH_PACKET_PENDING_ACKS          20     //- Maximum number of ACKs a device can hold at the same time. Maximum is 255.
-#define MESH_PACKET_NODE_EXPIRE_TIME_MS   900000 //- Timeout value for route
+#define MESH_PACKET_NODE_EXPIRE_TIME_MS   900000 //- Timeout value for route. Default is 15 minutes.
 
 #define MAX_IOT_DEVICES                   128    //- Maximum is 255.
 
@@ -152,6 +150,7 @@ void meshPacket_OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status
 
 //========================================= VALIDATION CHECKS ==============================================//
 static_assert(MESH_PACKET_HEADER_LENGTH == offsetof(meshPacket_t, payload), "ERROR: meshPacket_t header length mismatch!");
+
 void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 
@@ -232,10 +231,12 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  			---	2026-09-04	---
 				  --- v1.7.0 ---
 				  
-	  1. FEATURE: Flood beacon introduced handled by meshPacket_sendBeacon(...) function for better route discovery (RREQ - Route Request / RREP - Route Reply).
-	  2. CHORE: Minor code maintenance (no functional changes).
-	  3. FEATURE: Users can define their own meshPacket_messageHandler(...) callback to control how messages are output (Serial, terminal, or custom destinations).
-	  4. 
+	  1. FEATURE: Flood beacon introduced handled by meshPacket_sendBeacon(...) function for better route discovery (RREQ - Route Request / RREP - Route Reply). Note that
+			beacon responses do not support multiple acceptedDeviceIDs[0] entries; only the first entry is used as the sourceID.
+	  2. CHORE: Minor code readability maintenance (no functional changes).
+	  3. FEATURE: Users can define their own meshPacket_messageHandler(...) callback to control output messages (serial, terminal, or custom destinations).
+	  4. CHORE: README.md updated to fix grammatic mistakes, improve readability and describe new features added.
+	  5. 
 */
 
 
