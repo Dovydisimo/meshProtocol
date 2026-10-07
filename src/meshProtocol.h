@@ -17,6 +17,10 @@
 	  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
 	  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
 	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
+	  14. MINOR BUG: meshPacketCache is zero initialized, so UID=0, source=0 packet are dropped by meshPacket_isPacketSeen. 
+	  15. FEATURE: Failed unicast (after retransmission) should drop the routing table.
+	  16. Decide how to handle retransmissions (leave it to USER like <1.7.0 or handle it in library like >=1.8.0).
+	  17. 
   
 */
 
@@ -32,18 +36,18 @@
 //========================================= DEFINES ==============================================//
 #define ENABLE_DEBUG_MESSAGES                    //- Great for debugging, comment for production code.
 
-#define MAX_PEERS                         20     //- Limited by ESP-NOW.
-#define MAXIMUM_PACKET_LENGTH	          250    //- Limited by ESP-NOW maximum packet size.
+#define MAX_PEERS                   20     //- Limited by ESP-NOW.
+#define MAXIMUM_PACKET_LENGTH		250    //- Limited by ESP-NOW maximum packet size.
 
-#define MESH_PACKET_MAX_ROUTES            30     //- Maximum number of routes a device can hold. Maximum is 255.
-#define MESH_PACKET_CACHE_SIZE            25     //- Number of mesh packets device remembers. Maximum is 255.
-#define MESH_PACKET_HEADER_LENGTH         11     //- Driven by meshPacket_t structure.
-#define MESH_PACKET_HOP_LIMIT             5      //- 5-hop limit. Maximum is 255.
-#define MESH_PACKET_QUEUE_LENGTH          36     //- Queue length to store meshPackets.
-#define MESH_PACKET_PENDING_ACKS          20     //- Maximum number of ACKs a device can hold at the same time. Maximum is 255.
-#define MESH_PACKET_NODE_EXPIRE_TIME_MS   900000 //- Timeout value for route. Default is 15 minutes.
-
-#define MAX_IOT_DEVICES                   128    //- Maximum is 255.
+#define MESH_PACKET_MAX_ROUTES            		30     //- Maximum number of routes a device can hold. Maximum is 255.
+#define MESH_PACKET_CACHE_SIZE            		25     //- Number of mesh packets device remembers. Maximum is 255.
+#define MESH_PACKET_HEADER_LENGTH         		11     //- Driven by meshPacket_t structure.
+#define MESH_PACKET_HOP_LIMIT             		5      //- 6-hop limit (0 is included). Maximum is 255.
+#define MESH_PACKET_QUEUE_LENGTH          		36     //- Queue length to store meshPackets.
+#define MESH_PACKET_PENDING_ACKS          		20     //- Maximum number of ACKs a device can hold at the same time. Maximum is 255.
+#define MESH_PACKET_NODE_EXPIRE_TIME_MS   		900000 //- Timeout value for route. Default is 15 minutes.
+#define MAX_IOT_DEVICES                   		128    //- Maximum is 255.
+#define MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB  	6      //- A same-length alternative route must beat the current one by this much (dB) to replace it.
 
 //----------------- DEVICES (CUSTOM) -----------------//
 #define DEVICE_ID_INTERNET_GATEWAY        	0
@@ -109,7 +113,8 @@ struct __attribute__((packed)) routingTable_t
     uint8_t destinationID;      //- Final node we want to reach.
     uint8_t nextHopMAC[6];      //- MAC of the next hop.
     uint32_t lastSeen;          //- millis() timestamp for aging.
-    int8_t lastRSSI;
+    int8_t lastRSSI;			//- Last RSSI received.
+	uint8_t hops;               //- Hops to destination via nextHopMAC (1 = direct neighbour).
 };
 
 struct __attribute__((packed)) PendingAck_t
@@ -126,7 +131,7 @@ esp_err_t meshPacket_init(uint8_t wifiChannel);
 esp_err_t meshProtocol_addPeer(const uint8_t *mac, uint8_t nodeID, uint8_t wifiChannel);
 esp_err_t meshProtocol_removePeer(uint8_t *mac);
 int meshPacket_routeFind(uint8_t destID);
-esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI); //- ToDo: Fix limitation of "want last-seen route wins".
+esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops);
 void meshPacket_routeAge();
 void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier);
 bool meshPacket_isPacketSeen(uint8_t sourceID, uint16_t uniqueIdentifier);
@@ -214,7 +219,7 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
       9. CHORE: Library implementation documentation updated.
       10. FEATURE: #define ENABLE_DEBUG_MESSAGES is implemented to enable/disable debug messages.
       11. FEATURE: Last received RSSI is now stored in routing table.
-      12. CHORES: Chores around code comments and other miscellaneous stuff.
+      12. CHORE: Chores around code comments and other miscellaneous stuff.
       13. 
 	  
 	             --- 2025-11-18  ---
@@ -237,6 +242,21 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  3. FEATURE: Users can define their own meshPacket_messageHandler(...) callback to control output messages (serial, terminal, or custom destinations).
 	  4. CHORE: README.md updated to fix grammatic mistakes, improve readability and describe new features added.
 	  5. 
+	  
+				---	2026-10-07	---
+				  --- v1.8.0 ---
+
+      1. FIX: Broadcast packets are now handled locally AND retransmitted (flooded), so beacons reach multi-hop neighbours. Previously broadcasts were processed but never forwarded.
+      2. FEATURE: Beacons are ACKed for route discovery (ACK source is acceptedDeviceIDs[0]). Other broadcasts are no longer ACKed, which fixes ACKs with sourceID 254 that
+			created route to DEVICE_ID_BROADCAST.
+      3. FIX: Unconfigured devices (acceptedDeviceIDs[0] == DEVICE_ID_UNCONFIGURED) no longer ACK beacons, but still forward them.
+      4. FIX: meshPacket_sendMessage() no longer adds a pending ACK entry for broadcast packets, as they cannot be tracked per destination.
+      5. FEATURE: Hop-count based routing. routingTable_t now stores "hops" (derived from MESH_PACKET_HOP_LIMIT - TTL + 1). An existing route's next hop is replaced only by a path with
+			fewer hops, or equal hops and RSSI better by MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB. Packets arriving via a worse alternative no longer refresh "lastSeen", so a dead route can expire.
+      6. CHORE: meshPacket_routeAdd(..) now takes a "hops" argument and decides whether to add, refresh or replace a route. It also now logs "New route" and "Route changed" messages.
+      7. FEATURE: meshPacket_printRoutingTable() now has a "Hops" column.
+      8. FIX: Agged routed are now also removed from ESP-NOW by meshProtocol_removePeer(..) function.
+	  9. 
 */
 
 

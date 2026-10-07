@@ -142,10 +142,20 @@ int meshPacket_routeFind(uint8_t destID)
   return -1;
 }
 
-esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI) //- ToDo: Fix limitation of "want last-seen route wins".
+esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops)
 {
   int idx = meshPacket_routeFind(destID);
-  if(idx < 0) //- No existing route, try to allocate a new slot.
+  if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is better.
+  {
+    bool sameNextHop = (memcmp(routingTable[idx].nextHopMAC, nextHopMAC, 6) == 0);
+    bool betterPath = (hops < routingTable[idx].hops) || (hops == routingTable[idx].hops && RSSI > routingTable[idx].lastRSSI + MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB);
+    if(!sameNextHop && !betterPath) return ESP_OK; //- Keep current route. Don't refresh lastSeen, so a dead best route can still expire.
+
+    #ifdef ENABLE_DEBUG_MESSAGES
+    if(!sameNextHop) meshPacket_sendTerminalMessage("[MESH][INFO]: Route to D%02d changed (%d -> %d hops)\n", destID, routingTable[idx].hops, hops);
+    #endif
+  }
+  else //- No existing route, try to allocate a new slot.
   {
     for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES; i++)
     {
@@ -156,14 +166,19 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
       }
     }
   }
-  if(idx < 0) return ESP_FAIL; //- Return when no route is found or table is full.
+  if(idx < 0) return ESP_FAIL; //- Return FAIL when no route is found or table is full.
 
   routingTable[idx].inUse = true;
   routingTable[idx].destinationID = destID;
   routingTable[idx].lastSeen = millis();
   routingTable[idx].lastRSSI = RSSI;
+  routingTable[idx].hops = hops;
   memcpy(routingTable[idx].nextHopMAC, nextHopMAC, 6);
-  
+
+  #ifdef ENABLE_DEBUG_MESSAGES
+  if(idx < 0) meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d (%d hops)\n", destID, hops);
+  #endif
+
   meshProtocol_addPeer(nextHopMAC, destID, 0); //- Let's also try to add new peer device. Fail is expected since MESH_PACKET_MAX_ROUTES > MAX_PEERS.
   return ESP_OK;
 }
@@ -176,6 +191,7 @@ void meshPacket_routeAge()
     if(routingTable[i].inUse && (now - routingTable[i].lastSeen > MESH_PACKET_NODE_EXPIRE_TIME_MS))
     {
       routingTable[i].inUse = false; //- Mark as expired.
+	  meshProtocol_removePeer(routingTable[i].nextHopMAC); //- Remove peer from ESP-NOW.
 
       #ifdef ENABLE_DEBUG_MESSAGES
       meshPacket_sendTerminalMessage("[MESH][INFO]: Route for D%02d expired\n", routingTable[i].destinationID);
@@ -334,7 +350,7 @@ esp_err_t meshPacket_sendMessage(uint8_t sourceID, uint8_t destinationID, uint8_
   //- Remember mesh packet, so it could be ignored immidiately.
   meshPacket_rememberPacket(sendPacket.sourceID, sendPacket.uniqueIdentifier);
 
-  if(packetType != PACKET_TYPE_ACKNOWLEDGEMENT)
+  if(packetType != PACKET_TYPE_ACKNOWLEDGEMENT && destinationID != DEVICE_ID_BROADCAST) //- Broadcasts can't be tracked per destination.
   {
     meshPacket_addPendingAck(sendPacket.uniqueIdentifier, sendPacket.destinationID, &sendPacket);
   }
@@ -406,7 +422,7 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
     meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, RSSI: %ddBm\n", receivedPacket->sourceID, receivedPacket->destinationID, receivedPacket->packetType, receivedPacket->payloadLength, receivedPacket->uniqueIdentifier, localQueuePacket.RSSI);
     #endif
 
-    //- Accept if destinationID matches any in acceptedDeviceIDs OR is broadcast (0xFF).
+    //- Accept if destinationID matches any in acceptedDeviceIDs OR is broadcast.
     volatile bool meshPacket_packetProcessed = false;
     for(uint8_t i = 0; i < acceptedDeviceCount; i++)
     {
@@ -429,24 +445,26 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
       }
     }
     
-    //- Learn reverse route: "to reach S, forward via MAC"
-    int index = meshPacket_routeFind(receivedPacket->sourceID);
-    if(index >= 0) //- Update metadata if route already exist.
-    {
-      routingTable[index].lastSeen = millis(); //- Update timestamp.
-      routingTable[index].lastRSSI = localQueuePacket.RSSI; //- Update RSSI.
-    }
-    else
-    {
-      meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI);
-
-      #ifdef ENABLE_DEBUG_MESSAGES
-      meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d\n", receivedPacket->sourceID);
-      #endif
-    }
+    //- Learn reverse route: "to reach S, forward via MAC". NOTE: Must run before retransmit, which decrements TTL. A direct neighbour sees TTL == HOP_LIMIT -> 1 hop.
+    uint8_t hops = (receivedPacket->TTL <= MESH_PACKET_HOP_LIMIT) ? (MESH_PACKET_HOP_LIMIT - receivedPacket->TTL + 1) : 1; //- Clamp bogus TTL.
+    meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops);
     
-    //- Packet wasn't meant for me, let's route it.
-    if(!meshPacket_packetProcessed)
+	//- Packet was meant for me, let's return ACK (beacons are ACKed for route discovery, other broadcasts are not).
+    bool needsAck = receivedPacket->packetType == PACKET_TYPE_BEACON || receivedPacket->destinationID != DEVICE_ID_BROADCAST;
+	if(meshPacket_packetProcessed && receivedPacket->packetType != PACKET_TYPE_ACKNOWLEDGEMENT && needsAck && acceptedDeviceIDs[0] != DEVICE_ID_UNCONFIGURED)
+	{
+      #ifdef ENABLE_DEBUG_MESSAGES
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", receivedPacket->destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, receivedPacket->uniqueIdentifier);
+      #endif
+
+      //- Send acknowledgement. 
+	  //- LIMITATION: Beacon responses do not support multiple acceptedDeviceIDs[0] and only use first entry as sourceID.
+	  uint8_t destinationID = receivedPacket->packetType == PACKET_TYPE_BEACON ? acceptedDeviceIDs[0] : receivedPacket->destinationID;
+      meshPacket_sendMessage(destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, NULL, 0, false, receivedPacket->uniqueIdentifier);
+    }
+	
+    //- Packet wasn't meant for me, or is a broadcast: let's route/flood it.
+	if(!meshPacket_packetProcessed || receivedPacket->destinationID == DEVICE_ID_BROADCAST)
     { 
       int idx = meshPacket_routeFind(receivedPacket->destinationID);
       const uint8_t *mac = (idx >= 0) ? routingTable[idx].nextHopMAC : meshPacket_broadcastAddress;
@@ -459,21 +477,6 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
 
       meshPacket_retransmitPacket(receivedPacket, mac);
     }
-
-    //- Packet was meant for me, let's return ACK.
-    if(meshPacket_packetProcessed && receivedPacket->packetType != PACKET_TYPE_ACKNOWLEDGEMENT)
-    {
-      #ifdef ENABLE_DEBUG_MESSAGES
-      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", receivedPacket->destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, receivedPacket->uniqueIdentifier);
-      #endif
-
-      //- Send acknowledgement. 
-	  //- LIMITATION: Beacon responses do not support multiple acceptedDeviceIDs[0] and only use first entry as sourceID.
-	  uint8_t destinationID = receivedPacket->packetType == PACKET_TYPE_BEACON ? acceptedDeviceIDs[0] : receivedPacket->destinationID;
-      meshPacket_sendMessage(destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, NULL, 0, false, receivedPacket->uniqueIdentifier);
-    }
-
-    //- ToDo: Pridėti atskirą BROADCAST persiuntimą.
   }
 
   //checkRetransmissions(); //- ToDo: Move to a better place?
@@ -503,23 +506,24 @@ __attribute__((weak)) void meshPacket_messageHandler(const char *message)
 //====================================== HELPER FUNCTIONS =============================================//
 void meshPacket_printRoutingTable() 
 {
-  meshPacket_sendTerminalMessage("\n========================== Routing Table ==========================\n");
-  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) |\n");
-  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|\n");
+  meshPacket_sendTerminalMessage("\n============================== Routing Table ==============================\n");
+  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) | Hops |\n");
+  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|------|\n");
 
   for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES; i++) 
   {
     if(routingTable[i].inUse) 
     {
-      meshPacket_sendTerminalMessage("%3d | %6d | %02X:%02X:%02X:%02X:%02X:%02X | %11lu | %-5s | %12d |\n",
+      meshPacket_sendTerminalMessage("%3d | %6d | %02X:%02X:%02X:%02X:%02X:%02X | %11lu | %-5s | %10d | %4d |\n",
         i,
         routingTable[i].destinationID,
         routingTable[i].nextHopMAC[0], routingTable[i].nextHopMAC[1], routingTable[i].nextHopMAC[2],
         routingTable[i].nextHopMAC[3], routingTable[i].nextHopMAC[4], routingTable[i].nextHopMAC[5],
         millis() - routingTable[i].lastSeen,
         routingTable[i].inUse ? "Yes" : "No",
-        routingTable[i].lastRSSI);
+        routingTable[i].lastRSSI,
+        routingTable[i].hops);
     }
   }
-  meshPacket_sendTerminalMessage("===================================================================\n");
+  meshPacket_sendTerminalMessage("===========================================================================\n");
 }
