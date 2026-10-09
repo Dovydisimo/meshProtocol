@@ -144,7 +144,7 @@ int meshPacket_routeFind(uint8_t destID)
 
 esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops)
 {
-  int idx = meshPacket_routeFind(destID);
+  int idx = meshPacket_routeFind(destID); 
   if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is better.
   {
     bool sameNextHop = (memcmp(routingTable[idx].nextHopMAC, nextHopMAC, 6) == 0);
@@ -166,8 +166,10 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
       }
     }
   }
+  
   if(idx < 0) return ESP_FAIL; //- Return FAIL when no route is found or table is full.
 
+  //- Otherwise assign new route to free idx slot.
   routingTable[idx].inUse = true;
   routingTable[idx].destinationID = destID;
   routingTable[idx].lastSeen = millis();
@@ -176,7 +178,7 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
   memcpy(routingTable[idx].nextHopMAC, nextHopMAC, 6);
 
   #ifdef ENABLE_DEBUG_MESSAGES
-  if(idx < 0) meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d (%d hops)\n", destID, hops);
+  meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d (%d hops)\n", destID, hops);
   #endif
 
   meshProtocol_addPeer(nextHopMAC, destID, 0); //- Let's also try to add new peer device. Fail is expected since MESH_PACKET_MAX_ROUTES > MAX_PEERS.

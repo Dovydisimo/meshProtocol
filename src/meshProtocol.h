@@ -257,6 +257,13 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
       7. FEATURE: meshPacket_printRoutingTable() now has a "Hops" column.
       8. FIX: Agged routed are now also removed from ESP-NOW by meshProtocol_removePeer(..) function.
 	  9. 
+	  
+  				---	2026-10-09	---
+				  --- v1.8.1 ---
+				  
+	  1. FIX: New route debug message is not sent when new route is found.
+	  2. 
+
 */
 
 
