@@ -49,15 +49,6 @@
 #define MAX_IOT_DEVICES                   		128    //- Maximum is 255.
 #define MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB  	6      //- A same-length alternative route must beat the current one by this much (dB) to replace it.
 
-//----------------- DEVICES (CUSTOM) -----------------//
-#define DEVICE_ID_INTERNET_GATEWAY        	0
-#define DEVICE_ID_MPPT_CONTROLLER         	1
-#define DEVICE_ID_WATER_BOILER            	2
-#define DEVICE_ID_SAUNA_CONTROLLER        	3
-#define DEVICE_ID_MPPT_CONTROLLER_2       	4
-#define DEVICE_ID_CLIMATE_LOGGER_0			5
-#define DEVICE_ID_CLIMATE_LOGGER_1			6
-
 
 //----------------- SERVICE DEVICES -----------------//
 #define DEVICE_ID_DATABASE                250
@@ -100,13 +91,6 @@ struct __attribute__((packed)) meshPacketCache_t
   //uint32_t lastSeen;
 };
 
-struct __attribute__((packed)) knownPeers_t
-{
-  bool inUse;
-  uint8_t nodeID;
-  uint8_t MAC[6];
-};
-
 struct __attribute__((packed)) routingTable_t
 {
     bool inUse;                 //- Marks the slot as used/unused.
@@ -128,8 +112,6 @@ struct __attribute__((packed)) PendingAck_t
 
 //========================================= FUNCTION PROTOTYPES ==============================================//
 esp_err_t meshPacket_init(uint8_t wifiChannel);
-esp_err_t meshProtocol_addPeer(const uint8_t *mac, uint8_t nodeID, uint8_t wifiChannel);
-esp_err_t meshProtocol_removePeer(uint8_t *mac);
 int meshPacket_routeFind(uint8_t destID);
 esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops);
 void meshPacket_routeAge();
@@ -246,14 +228,13 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 				---	2026-10-07	---
 				  --- v1.8.0 ---
 
-      1. FIX: Broadcast packets are now handled locally AND retransmitted (flooded), so beacons reach multi-hop neighbours. Previously broadcasts were processed but never forwarded.
-      2. FEATURE: Beacons are ACKed for route discovery (ACK source is acceptedDeviceIDs[0]). Other broadcasts are no longer ACKed, which fixes ACKs with sourceID 254 that
-			created route to DEVICE_ID_BROADCAST.
-      3. FIX: Unconfigured devices (acceptedDeviceIDs[0] == DEVICE_ID_UNCONFIGURED) no longer ACK beacons, but still forward them.
-      4. FIX: meshPacket_sendMessage() no longer adds a pending ACK entry for broadcast packets, as they cannot be tracked per destination.
-      5. FEATURE: Hop-count based routing. routingTable_t now stores "hops" (derived from MESH_PACKET_HOP_LIMIT - TTL + 1). An existing route's next hop is replaced only by a path with
-			fewer hops, or equal hops and RSSI better by MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB. Packets arriving via a worse alternative no longer refresh "lastSeen", so a dead route can expire.
-      6. CHORE: meshPacket_routeAdd(..) now takes a "hops" argument and decides whether to add, refresh or replace a route. It also now logs "New route" and "Route changed" messages.
+      1. FIX: Broadcast packets are now handled locally AND retransmitted (flooded), so beacons reach multi-hop neighbours.
+      2. FEATURE: Beacons are ACKed for route discovery (ACK source is acceptedDeviceIDs[0]). Other broadcasts are no longer ACKed (their ACKs had sourceID 254).
+      3. FIX: Unconfigured devices no longer ACK beacons, but still forward them.
+      4. FIX: meshPacket_sendMessage() no longer adds a pending ACK entry for broadcast packets.
+      5. FEATURE: Hop-count based routing. routingTable_t stores "hops" (MESH_PACKET_HOP_LIMIT - TTL + 1). A route's next hop is replaced only by fewer hops, or equal hops and RSSI
+			better by MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB. Packets via a worse alternative no longer refresh "lastSeen", so a dead route can expire.
+      6. CHORE: meshPacket_routeAdd(..) takes a "hops" argument, decides add/refresh/replace and logs "New route" / "Route changed".
       7. FEATURE: meshPacket_printRoutingTable() now has a "Hops" column.
       8. FIX: Agged routed are now also removed from ESP-NOW by meshProtocol_removePeer(..) function.
 	  9. 
@@ -261,8 +242,17 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
   				---	2026-10-09	---
 				  --- v1.8.1 ---
 				  
-	  1. FIX: New route debug message is not sent when new route is found.
-	  2. 
+	  1. FIX: "New route" debug message was printed every time a route was refreshed. It is now printed only when a new route is assigned.
+	  2. FIX: meshPacket_routeAdd(..) rejects reserved IDs (DEVICE_ID_BROADCAST, DEVICE_ID_UNCONFIGURED). Devices running older library versions could send a route to 254 which
+			was learned.
+	  3. FIX: meshPacket_processPackets(..) no longer learns a route to its own IDs (acceptedDeviceIDs), e.g. from a stale echo of its own packet after the seen-cache wrapped.
+			This only appears as an edge case in very busy networks.
+	  4. CHORE: Peer handling reworked. Removed knownPeers_t, meshProtocol_addPeer(..), meshProtocol_removePeer(..). Next hops are registered as ESP-NOW peers on first use by
+			internal meshPacket_nextHop(..), with broadcast fallback when there is no route or the peer table is full.
+	  5. FEATURE: Internal meshPacket_prunePeers(..) removes ESP-NOW peers that no active route uses. Runs after routes expire and when adding a peer fails (add is retried once).
+	  6. CHORE: keywords.txt updated (removed knownPeers_t, meshProtocol_addPeer, meshProtocol_removePeer). MAX_PEERS is now used to size the prune list.
+	  7. CHORE: Custom devices macros 'DEVICES (CUSTOM)' removed. 
+	  8. 
 
 */
 

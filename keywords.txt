@@ -8,7 +8,6 @@
 meshPacket_t            KEYWORD1
 meshPacketQueue_t       KEYWORD1
 meshPacketCache_t       KEYWORD1
-knownPeers_t            KEYWORD1
 routingTable_t          KEYWORD1
 PendingAck_t            KEYWORD1
 
@@ -16,8 +15,6 @@ PendingAck_t            KEYWORD1
 # Methods and Functions (KEYWORD2)
 #######################################
 meshPacket_init                 KEYWORD2
-meshProtocol_addPeer            KEYWORD2
-meshProtocol_removePeer         KEYWORD2
 meshPacket_routeFind            KEYWORD2
 meshPacket_routeAdd             KEYWORD2
 meshPacket_routeAge             KEYWORD2

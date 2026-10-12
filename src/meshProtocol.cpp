@@ -26,7 +26,6 @@ uint8_t meshPacket_broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 
 meshPacketCache_t meshPacketCache[MESH_PACKET_CACHE_SIZE];
-knownPeers_t knownPeers[MAX_PEERS];
 routingTable_t routingTable[MESH_PACKET_MAX_ROUTES];
 PendingAck_t pending[MESH_PACKET_PENDING_ACKS];
 
@@ -69,69 +68,13 @@ esp_err_t meshPacket_init(uint8_t wifiChannel)
   esp_now_register_send_cb(esp_now_send_cb_t(meshPacket_OnDataSent)); //- Register Send callback to get the status of trasnmitted packet.
   esp_now_register_recv_cb(esp_now_recv_cb_t(meshPacket_OnDataRecv)); //- Register callback to get received packet info.
 
-  return meshProtocol_addPeer(meshPacket_broadcastAddress, DEVICE_ID_BROADCAST, wifiChannel); //- Finally let's add broadcast pair.
+  //- Register broadcast peer. Unicast next hops are registered lazily in meshPacket_nextHop().
+  esp_now_peer_info_t broadcastPeer = {};
+  memcpy(broadcastPeer.peer_addr, meshPacket_broadcastAddress, 6);
+  broadcastPeer.channel = wifiChannel;
+  broadcastPeer.encrypt = false;
+  return esp_now_add_peer(&broadcastPeer);
 }
-
-esp_err_t meshProtocol_addPeer(const uint8_t *mac, uint8_t nodeID, uint8_t wifiChannel)
-{
-  if(esp_now_is_peer_exist(mac)) return ESP_OK;
-  if(nodeID == DEVICE_ID_UNCONFIGURED) return ESP_FAIL; //- Reject some IDs from being added as a peer.
-
-  int idx = -1; 
-  for(uint8_t i = 0; i < MAX_PEERS; i++)
-  {
-    if(knownPeers[i].inUse == false) //- Find available slot.
-    {
-      idx = i;
-      break;
-    }
-  }
-  if(idx == -1) return ESP_FAIL; //- Return on no available slot.
-
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = wifiChannel;
-  peerInfo.encrypt = false;
-
-  if(esp_now_add_peer(&peerInfo) == ESP_OK)
-  {
-      knownPeers[idx].inUse = true;
-      knownPeers[idx].nodeID = nodeID;
-      memcpy(knownPeers[idx].MAC, mac, 6);
-      return ESP_OK;
-  }
-  return ESP_FAIL;
-}
-
-esp_err_t meshProtocol_removePeer(uint8_t *mac)
-{
-  if(!esp_now_is_peer_exist(mac)) return ESP_FAIL;
-  for(uint8_t i = 0; i < MAX_PEERS; i++)
-  {
-    if(knownPeers[i].inUse == false) continue; //- Skip unused slots.
-    if(memcmp(mac, knownPeers[i].MAC, 6) == 0) 
-    {
-      if(esp_now_del_peer(mac) == ESP_OK)
-      {
-        knownPeers[i].inUse = false;
-        knownPeers[i].nodeID = 0;
-        memset(knownPeers[i].MAC, 0, 6);
-        return ESP_OK;
-      }
-      return ESP_FAIL;
-    }
-  }
-  return ESP_FAIL;
-}
-
-/*uint8_t *meshPacket_findMACbyID(uint8_t deviceID)
-{
-  for(uint8_t i = 0; i < MAX_PEERS; i++)
-  {
-    if(knownPeers[i].inUse && knownPeers[i].nodeID == deviceID) return knownPeers[i].MAC;
-  }
-  return NULL;
-}*/
 
 int meshPacket_routeFind(uint8_t destID)
 {
@@ -142,9 +85,66 @@ int meshPacket_routeFind(uint8_t destID)
   return -1;
 }
 
+//- Unregisters ESP-NOW peers that are neither the broadcast address nor the next hop of any active route.
+static void meshPacket_prunePeers()
+{
+  uint8_t stale[MAX_PEERS][6];
+  uint8_t staleCount = 0;
+
+  esp_now_peer_info_t peer;
+  bool fromHead = true;
+  while(staleCount < MAX_PEERS && esp_now_fetch_peer(fromHead, &peer) == ESP_OK)
+  {
+    fromHead = false;
+    if(memcmp(peer.peer_addr, meshPacket_broadcastAddress, 6) == 0) continue; //- Never remove the broadcast peer.
+
+    bool used = false;
+    for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES && !used; i++)
+    {
+      used = routingTable[i].inUse && memcmp(routingTable[i].nextHopMAC, peer.peer_addr, 6) == 0;
+    }
+    if(!used) memcpy(stale[staleCount++], peer.peer_addr, 6);
+  }
+
+  for(uint8_t i = 0; i < staleCount; i++) //- Delete after iterating, so the peer list isn't modified mid-walk.
+  {
+    esp_now_del_peer(stale[i]);
+
+    #ifdef ENABLE_DEBUG_MESSAGES
+    meshPacket_sendTerminalMessage("[MESH][INFO]: Peer %02X:%02X:%02X:%02X:%02X:%02X removed\n", stale[i][0], stale[i][1], stale[i][2], stale[i][3], stale[i][4], stale[i][5]);
+    #endif
+  }
+}
+
+//- Returns the MAC to transmit to for destID: the route's next hop (registered as an ESP-NOW peer on first use), or broadcast when there is no route or the peer table is full.
+static const uint8_t *meshPacket_nextHop(uint8_t destID, int *routeIdx = NULL)
+{
+  int idx = meshPacket_routeFind(destID);
+  if(routeIdx != NULL) *routeIdx = idx;
+  if(idx < 0) return meshPacket_broadcastAddress;
+
+  const uint8_t *mac = routingTable[idx].nextHopMAC;
+  if(!esp_now_is_peer_exist(mac))
+  {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac, 6);
+    peerInfo.channel = 0; //- 0 = use the current Wi-Fi channel.
+    peerInfo.encrypt = false;
+    if(esp_now_add_peer(&peerInfo) != ESP_OK)
+    {
+      meshPacket_prunePeers(); //- Peer table is probably full: free slots held by old peers and retry once.
+      if(esp_now_add_peer(&peerInfo) != ESP_OK) return meshPacket_broadcastAddress; //- Still no room: fall back to flooding.
+    }
+  }
+  return mac;
+}
+
 esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops)
 {
-  int idx = meshPacket_routeFind(destID); 
+  if(destID == DEVICE_ID_BROADCAST || destID == DEVICE_ID_UNCONFIGURED) return ESP_ERR_INVALID_ARG; //- Never learn routes to reserved IDs (would hijack broadcast/beacon sends, which look up routes by destinationID).
+
+  int idx = meshPacket_routeFind(destID);
+  bool newRoute = (idx < 0); //- Result is -1 if no route exists. Keep this value as it can change later (free slot can be assigned).
   if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is better.
   {
     bool sameNextHop = (memcmp(routingTable[idx].nextHopMAC, nextHopMAC, 6) == 0);
@@ -169,7 +169,7 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
   
   if(idx < 0) return ESP_FAIL; //- Return FAIL when no route is found or table is full.
 
-  //- Otherwise assign new route to free idx slot.
+  //- Otherwise assign, refresh or replace the route in idx slot.
   routingTable[idx].inUse = true;
   routingTable[idx].destinationID = destID;
   routingTable[idx].lastSeen = millis();
@@ -178,28 +178,30 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
   memcpy(routingTable[idx].nextHopMAC, nextHopMAC, 6);
 
   #ifdef ENABLE_DEBUG_MESSAGES
-  meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d (%d hops)\n", destID, hops);
+  if(newRoute) meshPacket_sendTerminalMessage("[MESH][INFO]: New route to D%02d (%d hops)\n", destID, hops);
   #endif
 
-  meshProtocol_addPeer(nextHopMAC, destID, 0); //- Let's also try to add new peer device. Fail is expected since MESH_PACKET_MAX_ROUTES > MAX_PEERS.
   return ESP_OK;
 }
 
 void meshPacket_routeAge()
 {
   uint32_t now = millis();
+  bool anyExpired = false;
   for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES; i++)
   {
     if(routingTable[i].inUse && (now - routingTable[i].lastSeen > MESH_PACKET_NODE_EXPIRE_TIME_MS))
     {
       routingTable[i].inUse = false; //- Mark as expired.
-	  meshProtocol_removePeer(routingTable[i].nextHopMAC); //- Remove peer from ESP-NOW.
+      anyExpired = true;
 
       #ifdef ENABLE_DEBUG_MESSAGES
       meshPacket_sendTerminalMessage("[MESH][INFO]: Route for D%02d expired\n", routingTable[i].destinationID);
       #endif
     }
   }
+
+  if(anyExpired) meshPacket_prunePeers(); //- Drop ESP-NOW peers no remaining route uses.
 }
 
 void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier)
@@ -357,8 +359,8 @@ esp_err_t meshPacket_sendMessage(uint8_t sourceID, uint8_t destinationID, uint8_
     meshPacket_addPendingAck(sendPacket.uniqueIdentifier, sendPacket.destinationID, &sendPacket);
   }
 
-  int idx = meshPacket_routeFind(destinationID);
-  const uint8_t *mac = (idx >= 0) ? routingTable[idx].nextHopMAC : meshPacket_broadcastAddress;
+  int idx;
+  const uint8_t *mac = meshPacket_nextHop(destinationID, &idx);
 
   //- Log details, including MAC.
   #ifdef ENABLE_DEBUG_MESSAGES
@@ -447,9 +449,11 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
       }
     }
     
-    //- Learn reverse route: "to reach S, forward via MAC". NOTE: Must run before retransmit, which decrements TTL. A direct neighbour sees TTL == HOP_LIMIT -> 1 hop.
-    uint8_t hops = (receivedPacket->TTL <= MESH_PACKET_HOP_LIMIT) ? (MESH_PACKET_HOP_LIMIT - receivedPacket->TTL + 1) : 1; //- Clamp bogus TTL.
-    meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops);
+    //- Learn reverse route: "to reach S, forward via MAC". NOTE: Must run before retransmit, which decrements TTL (a direct neighbour sees TTL == HOP_LIMIT -> 1 hop).
+    uint8_t hops = (receivedPacket->TTL <= MESH_PACKET_HOP_LIMIT) ? (MESH_PACKET_HOP_LIMIT - receivedPacket->TTL + 1) : 1; //- Clamp bogus TTL (ex., TTL is higher than MESH_PACKET_HOP_LIMIT).
+    bool sourceIsMe = false; //- Never learn a route to ourselves (e.g. a stale echo of our own packet after the seen-cache wrapped).
+    for(uint8_t i = 0; i < acceptedDeviceCount; i++) if(receivedPacket->sourceID == acceptedDeviceIDs[i]) sourceIsMe = true; 
+    if(!sourceIsMe) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops);
     
 	//- Packet was meant for me, let's return ACK (beacons are ACKed for route discovery, other broadcasts are not).
     bool needsAck = receivedPacket->packetType == PACKET_TYPE_BEACON || receivedPacket->destinationID != DEVICE_ID_BROADCAST;
@@ -468,8 +472,8 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
     //- Packet wasn't meant for me, or is a broadcast: let's route/flood it.
 	if(!meshPacket_packetProcessed || receivedPacket->destinationID == DEVICE_ID_BROADCAST)
     { 
-      int idx = meshPacket_routeFind(receivedPacket->destinationID);
-      const uint8_t *mac = (idx >= 0) ? routingTable[idx].nextHopMAC : meshPacket_broadcastAddress;
+      int idx;
+      const uint8_t *mac = meshPacket_nextHop(receivedPacket->destinationID, &idx);
 
       //- Log details, including MAC.
       #ifdef ENABLE_DEBUG_MESSAGES
