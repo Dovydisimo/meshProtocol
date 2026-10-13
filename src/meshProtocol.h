@@ -252,7 +252,8 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  5. FEATURE: Internal meshPacket_prunePeers(..) removes ESP-NOW peers that no active route uses. Runs after routes expire and when adding a peer fails (add is retried once).
 	  6. CHORE: keywords.txt updated (removed knownPeers_t, meshProtocol_addPeer, meshProtocol_removePeer). MAX_PEERS is now used to size the prune list.
 	  7. CHORE: Custom devices macros 'DEVICES (CUSTOM)' removed. 
-	  8. 
+	  8. FIX: Debug message "Sending ACK: ..." was using a wrong sourceID for beacon messages.
+	  9. 
 
 */
 

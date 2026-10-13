@@ -459,14 +459,15 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
     bool needsAck = receivedPacket->packetType == PACKET_TYPE_BEACON || receivedPacket->destinationID != DEVICE_ID_BROADCAST;
 	if(meshPacket_packetProcessed && receivedPacket->packetType != PACKET_TYPE_ACKNOWLEDGEMENT && needsAck && acceptedDeviceIDs[0] != DEVICE_ID_UNCONFIGURED)
 	{
+      //- LIMITATION: Beacon responses do not support multiple acceptedDeviceIDs[0] and only use first entry as sourceID.
+	  uint8_t ackSourceID = receivedPacket->packetType == PACKET_TYPE_BEACON ? acceptedDeviceIDs[0] : receivedPacket->destinationID;
+
       #ifdef ENABLE_DEBUG_MESSAGES
-      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", receivedPacket->destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, receivedPacket->uniqueIdentifier);
+      meshPacket_sendTerminalMessage("[MESH][INFO]: Sending ACK: S%02d, D%02d, T%02d UID%05d\n", ackSourceID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, receivedPacket->uniqueIdentifier);
       #endif
 
-      //- Send acknowledgement. 
-	  //- LIMITATION: Beacon responses do not support multiple acceptedDeviceIDs[0] and only use first entry as sourceID.
-	  uint8_t destinationID = receivedPacket->packetType == PACKET_TYPE_BEACON ? acceptedDeviceIDs[0] : receivedPacket->destinationID;
-      meshPacket_sendMessage(destinationID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, NULL, 0, false, receivedPacket->uniqueIdentifier);
+      //- Send acknowledgement.
+      meshPacket_sendMessage(ackSourceID, receivedPacket->sourceID, PACKET_TYPE_ACKNOWLEDGEMENT, NULL, 0, false, receivedPacket->uniqueIdentifier);
     }
 	
     //- Packet wasn't meant for me, or is a broadcast: let's route/flood it.
