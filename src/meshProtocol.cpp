@@ -51,6 +51,9 @@ esp_err_t meshPacket_init(uint8_t wifiChannel)
   {
     return ESP_FAIL;
   }
+  
+  meshPacket_messageCounter = (uint16_t)esp_random();      //- Distinct UID range per boot (counter used to restart at 0).
+  memset(meshPacketCache, 0xFF, sizeof(meshPacketCache));  //- Sentinel instead of zero-init (0,0) entries.
 
   meshPacket_Queue = xQueueCreate(MESH_PACKET_QUEUE_LENGTH, sizeof(meshPacketQueue_t));
   if(meshPacket_Queue == NULL)

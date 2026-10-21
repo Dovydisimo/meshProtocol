@@ -17,7 +17,6 @@
 	  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
 	  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
 	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
-	  14. MINOR BUG: meshPacketCache is zero initialized, so UID=0, source=0 packet are dropped by meshPacket_isPacketSeen. 
 	  15. FEATURE: Failed unicast (after retransmission) should drop the routing table.
 	  16. Decide how to handle retransmissions (leave it to USER like <1.7.0 or handle it in library like >=1.8.0).
 	  17. 
@@ -253,7 +252,8 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  6. CHORE: keywords.txt updated (removed knownPeers_t, meshProtocol_addPeer, meshProtocol_removePeer). MAX_PEERS is now used to size the prune list.
 	  7. CHORE: Custom devices macros 'DEVICES (CUSTOM)' removed. 
 	  8. FIX: Debug message "Sending ACK: ..." was using a wrong sourceID for beacon messages.
-	  9. 
+	  9. FIX: meshPacketCache is zero initialized, so UID=0, source=0 packet are dropped by meshPacket_isPacketSeen in small mesh networks.
+	  10. 
 
 */
 
