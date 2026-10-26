@@ -142,20 +142,34 @@ static const uint8_t *meshPacket_nextHop(uint8_t destID, int *routeIdx = NULL)
   return mac;
 }
 
+//- Cost of a path: hops plus a penalty that grows linearly as the link RSSI drops from GOOD to POOR. NOTE: RSSI is only the last hop's link, not the whole path.
+static uint16_t meshPacket_pathCost(uint8_t hops, int8_t rssi)
+{
+  int16_t penalty = ((int16_t)MESH_LINK_RSSI_GOOD_DBM - rssi) * MESH_LINK_MAX_PENALTY / (MESH_LINK_RSSI_GOOD_DBM - MESH_LINK_RSSI_POOR_DBM);
+  if(penalty < 0) penalty = 0;
+  if(penalty > MESH_LINK_MAX_PENALTY) penalty = MESH_LINK_MAX_PENALTY;
+  return (uint16_t)hops * MESH_PACKET_COST_PER_HOP + penalty;
+}
+
 esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops)
 {
   if(destID == DEVICE_ID_BROADCAST || destID == DEVICE_ID_UNCONFIGURED) return ESP_ERR_INVALID_ARG; //- Never learn routes to reserved IDs (would hijack broadcast/beacon sends, which look up routes by destinationID).
 
   int idx = meshPacket_routeFind(destID);
   bool newRoute = (idx < 0); //- Result is -1 if no route exists. Keep this value as it can change later (free slot can be assigned).
-  if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is better.
+  int8_t storedRSSI = RSSI;
+  if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is clearly cheaper.
   {
     bool sameNextHop = (memcmp(routingTable[idx].nextHopMAC, nextHopMAC, 6) == 0);
-    bool betterPath = (hops < routingTable[idx].hops) || (hops == routingTable[idx].hops && RSSI > routingTable[idx].lastRSSI + MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB);
+    uint16_t currentCost = meshPacket_pathCost(routingTable[idx].hops, routingTable[idx].lastRSSI);
+    uint16_t newCost = meshPacket_pathCost(hops, RSSI);
+    bool betterPath = (newCost + MESH_PACKET_ROUTE_COST_HYSTERESIS < currentCost);
     if(!sameNextHop && !betterPath) return ESP_OK; //- Keep current route. Don't refresh lastSeen, so a dead best route can still expire.
 
+    if(sameNextHop) storedRSSI = (int8_t)((routingTable[idx].lastRSSI * 3 + RSSI) / 4); //- Smooth RSSI on the same link, so a single fade doesn't swing the cost.
+
     #ifdef ENABLE_DEBUG_MESSAGES
-    if(!sameNextHop) meshPacket_sendTerminalMessage("[MESH][INFO]: Route to D%02d changed (%d -> %d hops)\n", destID, routingTable[idx].hops, hops);
+    if(!sameNextHop) meshPacket_sendTerminalMessage("[MESH][INFO]: Route to D%02d changed (%d hops, cost %u -> %d hops, cost %u)\n", destID, routingTable[idx].hops, currentCost, hops, newCost);
     #endif
   }
   else //- No existing route, try to allocate a new slot.
@@ -176,7 +190,7 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
   routingTable[idx].inUse = true;
   routingTable[idx].destinationID = destID;
   routingTable[idx].lastSeen = millis();
-  routingTable[idx].lastRSSI = RSSI;
+  routingTable[idx].lastRSSI = storedRSSI;
   routingTable[idx].hops = hops;
   memcpy(routingTable[idx].nextHopMAC, nextHopMAC, 6);
 
@@ -426,7 +440,7 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
     meshPacket_rememberPacket(receivedPacket->sourceID, receivedPacket->uniqueIdentifier);
 
     #ifdef ENABLE_DEBUG_MESSAGES
-    meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, RSSI: %ddBm\n", receivedPacket->sourceID, receivedPacket->destinationID, receivedPacket->packetType, receivedPacket->payloadLength, receivedPacket->uniqueIdentifier, localQueuePacket.RSSI);
+    meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, TTL%d, RSSI: %ddBm, from %02X:%02X:%02X:%02X:%02X:%02X\n", receivedPacket->sourceID, receivedPacket->destinationID, receivedPacket->packetType, receivedPacket->payloadLength, receivedPacket->uniqueIdentifier, receivedPacket->TTL, localQueuePacket.RSSI, localQueuePacket.MAC[0], localQueuePacket.MAC[1], localQueuePacket.MAC[2], localQueuePacket.MAC[3], localQueuePacket.MAC[4], localQueuePacket.MAC[5]);
     #endif
 
     //- Accept if destinationID matches any in acceptedDeviceIDs OR is broadcast.
@@ -516,15 +530,15 @@ __attribute__((weak)) void meshPacket_messageHandler(const char *message)
 //====================================== HELPER FUNCTIONS =============================================//
 void meshPacket_printRoutingTable() 
 {
-  meshPacket_sendTerminalMessage("\n============================== Routing Table ==============================\n");
-  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) | Hops |\n");
-  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|------|\n");
+  meshPacket_sendTerminalMessage("\n================================== Routing Table ==================================\n");
+  meshPacket_sendTerminalMessage("Idx | DestID |    MAC Address    | LastSeen(ms)| InUse | RSSI (dBm) | Hops | Cost |\n");
+  meshPacket_sendTerminalMessage("----|--------|-------------------|-------------|-------|------------|------|------|\n");
 
   for(uint8_t i = 0; i < MESH_PACKET_MAX_ROUTES; i++) 
   {
     if(routingTable[i].inUse) 
     {
-      meshPacket_sendTerminalMessage("%3d | %6d | %02X:%02X:%02X:%02X:%02X:%02X | %11lu | %-5s | %10d | %4d |\n",
+      meshPacket_sendTerminalMessage("%3d | %6d | %02X:%02X:%02X:%02X:%02X:%02X | %11lu | %-5s | %10d | %4d | %4u |\n",
         i,
         routingTable[i].destinationID,
         routingTable[i].nextHopMAC[0], routingTable[i].nextHopMAC[1], routingTable[i].nextHopMAC[2],
@@ -532,8 +546,9 @@ void meshPacket_printRoutingTable()
         millis() - routingTable[i].lastSeen,
         routingTable[i].inUse ? "Yes" : "No",
         routingTable[i].lastRSSI,
-        routingTable[i].hops);
+        routingTable[i].hops,
+        meshPacket_pathCost(routingTable[i].hops, routingTable[i].lastRSSI));
     }
   }
-  meshPacket_sendTerminalMessage("===========================================================================\n");
+  meshPacket_sendTerminalMessage("==================================================================================\n");
 }

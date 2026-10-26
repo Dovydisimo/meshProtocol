@@ -14,7 +14,6 @@
 	  3. Peržiūrėti resursus, kuriuos dalinasi task'ai ir sudėti semhaphoras.
 	  5. Pabaigti implementaciją → checkRetransmissions().
 	  8. Pridėti benchmark statistikas.
-	  10. Ištrinti CUSTOM DEVICES ir juos sekti kažkur atskirai. Gal per root node'ą? 
 	  11. Padaryti konfiguruojamas meshPacket_OnDataRecv, meshPacket_OnDataSent funkcijas naudotojo, kad praplėsti mesh'o panaudojimą už ESP-NOW.
 	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
 	  15. FEATURE: Failed unicast (after retransmission) should drop the routing table.
@@ -46,7 +45,22 @@
 #define MESH_PACKET_PENDING_ACKS          		20     //- Maximum number of ACKs a device can hold at the same time. Maximum is 255.
 #define MESH_PACKET_NODE_EXPIRE_TIME_MS   		900000 //- Timeout value for route. Default is 15 minutes.
 #define MAX_IOT_DEVICES                   		128    //- Maximum is 255.
-#define MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB  	6      //- A same-length alternative route must beat the current one by this much (dB) to replace it.
+#define MESH_PACKET_ROUTE_COST_HYSTERESIS     	5      //- An alternative route must be cheaper than the current one by this much (cost units) to replace it.
+
+//- Route cost = hops * MESH_PACKET_COST_PER_HOP + link penalty. Lower is better. Retune the RSSI thresholds per radio (ESP-NOW vs LoRa).
+#ifndef MESH_PACKET_COST_PER_HOP
+#define MESH_PACKET_COST_PER_HOP          		10     //- Cost of one hop.
+#endif
+#ifndef MESH_LINK_RSSI_GOOD_DBM
+#define MESH_LINK_RSSI_GOOD_DBM           		(-80)  //- At or above this RSSI a link has no penalty.
+#endif
+#ifndef MESH_LINK_RSSI_POOR_DBM
+#define MESH_LINK_RSSI_POOR_DBM           		(-95)  //- At or below this RSSI a link gets the maximum penalty.
+#endif
+#ifndef MESH_LINK_MAX_PENALTY
+#define MESH_LINK_MAX_PENALTY             		25     //- Maximum link penalty (2.5 hops worth).
+#endif
+static_assert(MESH_LINK_RSSI_GOOD_DBM > MESH_LINK_RSSI_POOR_DBM, "ERROR: MESH_LINK_RSSI_GOOD_DBM must be higher than MESH_LINK_RSSI_POOR_DBM!");
 
 
 //----------------- SERVICE DEVICES -----------------//
@@ -253,7 +267,17 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  7. CHORE: Custom devices macros 'DEVICES (CUSTOM)' removed. 
 	  8. FIX: Debug message "Sending ACK: ..." was using a wrong sourceID for beacon messages.
 	  9. FIX: meshPacketCache is zero initialized, so UID=0, source=0 packet are dropped by meshPacket_isPacketSeen in small mesh networks.
-	  10. 
+	  10.
+
+				---	2026-10-26	---
+				  --- v1.9.0 ---
+
+	  1. FEATURE: Route selection uses a cost instead of "fewer hops always wins". NOTE: RSSI describes only the last hop's link, not the whole path.
+	  2. CHORE: MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB replaced by MESH_PACKET_ROUTE_COST_HYSTERESIS. An alternative route must be cheaper than the current one by this much to replace it.
+	  3. FEATURE: RSSI stored in a route is smoothed (3/4 old + 1/4 new) when the route is refreshed through the same next hop, so a single fade doesn't swing the cost.
+	  4. FEATURE: meshPacket_printRoutingTable() now has a "Cost" column and the "Route changed" debug message prints the old and new cost.
+	  5. CHORE: Debug message "Packet received: ..." now also prints the packet TTL and the MAC address of the transmitting neighbour (helps diagnosing route learning).
+	  6.
 
 */
 
