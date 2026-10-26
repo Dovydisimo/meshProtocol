@@ -18,7 +18,14 @@
 	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
 	  15. FEATURE: Failed unicast (after retransmission) should drop the routing table.
 	  16. Decide how to handle retransmissions (leave it to USER like <1.7.0 or handle it in library like >=1.8.0).
-	  17. 
+	  17. FEATURE: Accumulated path cost in the packet header. Use a byte of meshPacket_t "reserved" (currently NOT initialised in meshPacket_sendMessage(..), so it must be zeroed and all nodes
+			reflashed). Every forwarder adds the cost of the link it received the packet on (MESH_PACKET_COST_PER_HOP + RSSI penalty) before retransmitting, the receiver adds its last link.
+			Fits uint8_t (about 210 max). Fixes "RSSI describes only the last hop" and makes the cost transport independent (ESP-NOW + LoRa E28-2G4T27S), as every hop converts its own RSSI.
+	  18. FEATURE: Route staleness term in the cost (frozen lastRSSI makes a dead good link look great; must be longer than the slowest device's packet interval) and an "unusable link" floor
+			(RSSI penalty currently saturates at MESH_LINK_RSSI_POOR_DBM).
+	  19. FEATURE: Link asymmetry: RSSI shows how loud a neighbour is, not how well it hears us (high TX power nodes like E28-2G4T27S). Carry TX power in the header, or demote routes
+			when ACKs are missing (there are no MAC level ACKs / OnDataSent feedback on LoRa).
+	  20.
   
 */
 
@@ -101,6 +108,7 @@ struct __attribute__((packed)) meshPacketCache_t
 {
   uint8_t sourceID;
   uint16_t uniqueIdentifier;
+  uint8_t TTL;                //- TTL of the first copy of the packet (used to judge duplicate copies for route learning).
   //uint32_t lastSeen;
 };
 
@@ -126,9 +134,10 @@ struct __attribute__((packed)) PendingAck_t
 //========================================= FUNCTION PROTOTYPES ==============================================//
 esp_err_t meshPacket_init(uint8_t wifiChannel);
 int meshPacket_routeFind(uint8_t destID);
-esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops);
+esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops, bool allowCreate = true);
 void meshPacket_routeAge();
-void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier);
+void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier, uint8_t TTL = MESH_PACKET_HOP_LIMIT);
+int meshPacket_findSeenPacket(uint8_t sourceID, uint16_t uniqueIdentifier);
 bool meshPacket_isPacketSeen(uint8_t sourceID, uint16_t uniqueIdentifier);
 uint8_t meshPacket_getActiveDeviceCount(uint32_t lastSeenDeviceThreshold_ms);
 void meshPacket_markDelivered(uint16_t uniqueID, uint8_t fromNode);
@@ -280,7 +289,11 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  6. CHORE: README.md updated to match the code. Fixed stale statements: retransmission claim (library does not resend unACKed packets yet), route expiry (15 min),
 			"fastest win" route learning (now cost-based), maximum payload (239 bytes) and library size (~470 lines).
 	  7. CHORE: README.md now has "Route Selection", "Configuration" (compile-time defines) and "Limitations" sections, and describes beacon / flood behaviour.
-	  8.
+	  8. FEATURE: Routes are now learned from every received copy of a packet, not only the first one. Duplicate copies can only refresh or replace an existing route (never create one).
+	  9. CHORE: meshPacketCache_t stores the TTL of the first copy. New meshPacket_findSeenPacket(..) returns the cache index. meshPacket_rememberPacket(..) takes a TTL argument (default
+			MESH_PACKET_HOP_LIMIT) and meshPacket_routeAdd(..) takes an "allowCreate" argument (default true).
+	  10. CHORE: Route learning now runs before the packet callback, so a reply sent from inside the callback (ex., gateway answering a beacon) can already use the learned route.
+	  11.
 
 */
 

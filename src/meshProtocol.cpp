@@ -151,11 +151,12 @@ static uint16_t meshPacket_pathCost(uint8_t hops, int8_t rssi)
   return (uint16_t)hops * MESH_PACKET_COST_PER_HOP + penalty;
 }
 
-esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops)
+esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops, bool allowCreate)
 {
   if(destID == DEVICE_ID_BROADCAST || destID == DEVICE_ID_UNCONFIGURED) return ESP_ERR_INVALID_ARG; //- Never learn routes to reserved IDs (would hijack broadcast/beacon sends, which look up routes by destinationID).
 
   int idx = meshPacket_routeFind(destID);
+  if(idx < 0 && !allowCreate) return ESP_OK; //- Duplicate copies may only refresh/replace an existing route, never create one (an echo of our own forward could create a loop).
   bool newRoute = (idx < 0); //- Result is -1 if no route exists. Keep this value as it can change later (free slot can be assigned).
   int8_t storedRSSI = RSSI;
   if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is clearly cheaper.
@@ -221,10 +222,11 @@ void meshPacket_routeAge()
   if(anyExpired) meshPacket_prunePeers(); //- Drop ESP-NOW peers no remaining route uses.
 }
 
-void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier)
+void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier, uint8_t TTL)
 {
   meshPacketCache[meshPacket_cacheIndex].sourceID = sourceID;
   meshPacketCache[meshPacket_cacheIndex].uniqueIdentifier = uniqueIdentifier;
+  meshPacketCache[meshPacket_cacheIndex].TTL = TTL; //- TTL of the first copy, used to judge later duplicates.
   //meshPacketCache[meshPacket_cacheIndex].lastSeen = millis();
   meshPacket_cacheIndex = (meshPacket_cacheIndex + 1) % MESH_PACKET_CACHE_SIZE;
 
@@ -234,13 +236,19 @@ void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier)
   }
 }
 
-bool meshPacket_isPacketSeen(uint8_t sourceID, uint16_t uniqueIdentifier)
+//- Returns the seen-cache index of the packet, or -1 if it was not seen.
+int meshPacket_findSeenPacket(uint8_t sourceID, uint16_t uniqueIdentifier)
 {
   for(uint8_t i = 0; i < MESH_PACKET_CACHE_SIZE; i++)
   {
-    if(meshPacketCache[i].sourceID == sourceID && meshPacketCache[i].uniqueIdentifier == uniqueIdentifier) return 1;
+    if(meshPacketCache[i].sourceID == sourceID && meshPacketCache[i].uniqueIdentifier == uniqueIdentifier) return i;
   }
-  return 0;
+  return -1;
+}
+
+bool meshPacket_isPacketSeen(uint8_t sourceID, uint16_t uniqueIdentifier)
+{
+  return meshPacket_findSeenPacket(sourceID, uniqueIdentifier) >= 0;
 }
 
 uint8_t meshPacket_getActiveDeviceCount(uint32_t lastSeenDeviceThreshold_ms)
@@ -369,7 +377,7 @@ esp_err_t meshPacket_sendMessage(uint8_t sourceID, uint8_t destinationID, uint8_
   }
 
   //- Remember mesh packet, so it could be ignored immidiately.
-  meshPacket_rememberPacket(sendPacket.sourceID, sendPacket.uniqueIdentifier);
+  meshPacket_rememberPacket(sendPacket.sourceID, sendPacket.uniqueIdentifier, sendPacket.TTL);
 
   if(packetType != PACKET_TYPE_ACKNOWLEDGEMENT && destinationID != DEVICE_ID_BROADCAST) //- Broadcasts can't be tracked per destination.
   {
@@ -433,11 +441,23 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
   {
     meshPacket_t *receivedPacket = &localQueuePacket.queuePacket;
 
-    //- Drop mesh packet if already seen.
-    if(meshPacket_isPacketSeen(receivedPacket->sourceID, receivedPacket->uniqueIdentifier)) continue;
+    //- Learn reverse route: "to reach S, forward via MAC". NOTE: Runs for EVERY copy (also duplicates), before the packet is retransmitted (which decrements TTL; a direct neighbour sees TTL == HOP_LIMIT -> 1 hop).
+    uint8_t hops = (receivedPacket->TTL <= MESH_PACKET_HOP_LIMIT) ? (MESH_PACKET_HOP_LIMIT - receivedPacket->TTL + 1) : 1; //- Clamp bogus TTL (ex., TTL is higher than MESH_PACKET_HOP_LIMIT).
+    bool sourceIsMe = false; //- Never learn a route to ourselves (e.g. a stale echo of our own packet after the seen-cache wrapped).
+    for(uint8_t i = 0; i < acceptedDeviceCount; i++) if(receivedPacket->sourceID == acceptedDeviceIDs[i]) sourceIsMe = true;
+
+    int seenIdx = meshPacket_findSeenPacket(receivedPacket->sourceID, receivedPacket->uniqueIdentifier);
+    bool duplicate = (seenIdx >= 0);
+
+    if(!sourceIsMe)
+    {
+      if(!duplicate) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops, true);
+      else if(receivedPacket->TTL + 1 >= meshPacketCache[seenIdx].TTL) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops, false); //- Only copies at most 1 hop longer than the first copy count; this rules out our own forwarded packet echoed back by a neighbour (TTL - 2).
+    }
+    if(duplicate) continue; //- Everything below (callback, ACK, forwarding) still runs once per packet.
 
     //- Remember mesh packet.
-    meshPacket_rememberPacket(receivedPacket->sourceID, receivedPacket->uniqueIdentifier);
+    meshPacket_rememberPacket(receivedPacket->sourceID, receivedPacket->uniqueIdentifier, receivedPacket->TTL);
 
     #ifdef ENABLE_DEBUG_MESSAGES
     meshPacket_sendTerminalMessage("[MESH][INFO]: Packet received S%02d, D%02d, T%02d, Len%02d, UID%05d, TTL%d, RSSI: %ddBm, from %02X:%02X:%02X:%02X:%02X:%02X\n", receivedPacket->sourceID, receivedPacket->destinationID, receivedPacket->packetType, receivedPacket->payloadLength, receivedPacket->uniqueIdentifier, receivedPacket->TTL, localQueuePacket.RSSI, localQueuePacket.MAC[0], localQueuePacket.MAC[1], localQueuePacket.MAC[2], localQueuePacket.MAC[3], localQueuePacket.MAC[4], localQueuePacket.MAC[5]);
@@ -465,12 +485,6 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
         }
       }
     }
-    
-    //- Learn reverse route: "to reach S, forward via MAC". NOTE: Must run before retransmit, which decrements TTL (a direct neighbour sees TTL == HOP_LIMIT -> 1 hop).
-    uint8_t hops = (receivedPacket->TTL <= MESH_PACKET_HOP_LIMIT) ? (MESH_PACKET_HOP_LIMIT - receivedPacket->TTL + 1) : 1; //- Clamp bogus TTL (ex., TTL is higher than MESH_PACKET_HOP_LIMIT).
-    bool sourceIsMe = false; //- Never learn a route to ourselves (e.g. a stale echo of our own packet after the seen-cache wrapped).
-    for(uint8_t i = 0; i < acceptedDeviceCount; i++) if(receivedPacket->sourceID == acceptedDeviceIDs[i]) sourceIsMe = true; 
-    if(!sourceIsMe) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops);
     
 	//- Packet was meant for me, let's return ACK (beacons are ACKed for route discovery, other broadcasts are not).
     bool needsAck = receivedPacket->packetType == PACKET_TYPE_BEACON || receivedPacket->destinationID != DEVICE_ID_BROADCAST;

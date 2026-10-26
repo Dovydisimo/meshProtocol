@@ -97,7 +97,7 @@ cost = hops * MESH_PACKET_COST_PER_HOP + link penalty
 The link penalty grows linearly from 0 (RSSI at or above `MESH_LINK_RSSI_GOOD_DBM`, default -80 dBm) to `MESH_LINK_MAX_PENALTY` (RSSI at or below `MESH_LINK_RSSI_POOR_DBM`, default -95 dBm). Rules:
 
 * A different next hop replaces the current route only if its cost is lower by more than `MESH_PACKET_ROUTE_COST_HYSTERESIS` (default 5). This avoids route flapping.
-* Packets arriving via a worse alternative do not refresh `lastSeen`, so a dead best route can still expire.
+* Packets (and duplicate copies) arriving via a worse alternative do not refresh `lastSeen`, so a dead best route can still expire.
 * When a route is refreshed through the same next hop, the stored RSSI is smoothed (3/4 old + 1/4 new), so a single fade does not swing the cost.
 * NOTE: RSSI only describes the last hop's link, not the whole path.
 
@@ -106,7 +106,8 @@ The link penalty grows linearly from 0 (RSSI at or above `MESH_LINK_RSSI_GOOD_DB
 A mesh network wouldn't be complete without hopping. The above example shows initial transmission with more nodes than in the previous example. By following the logic described in **Route Discovery** section it can be seen
 how S00-D03 message is sent and ACK is received. This example is important to show to understand a few important points.
 
-Backward routes are learned from the first packet that arrives, but they are re-evaluated as more packets come in: a cheaper path (see [Route Selection](#route-selection)) replaces the current one once it beats it by the hysteresis margin.
+Backward routes are learned from the first copy of a packet that arrives, but they are re-evaluated as more packets come in: a cheaper path (see [Route Selection](#route-selection)) replaces the current one once it beats it by the hysteresis margin.
+Duplicate copies of a flooded packet (for example the same packet relayed by a neighbour) are also used for route learning, but only to refresh or replace an existing route, never to create one, and only if their TTL is at most 1 lower than the first copy's. This ignores our own forwarded packet echoed back by a neighbour. The packet itself is still handled only once.
 
 ### Safety Mechanisms
 Since, a fallback transmission rely on broadcasting duplicate messages cannot be avoided in congested areas. To manage this, the protocol stores a `uniqueIdentifier` in each packet header.

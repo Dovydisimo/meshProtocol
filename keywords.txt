@@ -19,6 +19,7 @@ meshPacket_routeFind            KEYWORD2
 meshPacket_routeAdd             KEYWORD2
 meshPacket_routeAge             KEYWORD2
 meshPacket_rememberPacket       KEYWORD2
+meshPacket_findSeenPacket       KEYWORD2
 meshPacket_isPacketSeen         KEYWORD2
 meshPacket_getActiveDeviceCount KEYWORD2
 meshPacket_markDelivered        KEYWORD2
