@@ -277,7 +277,10 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 	  3. FEATURE: RSSI stored in a route is smoothed (3/4 old + 1/4 new) when the route is refreshed through the same next hop, so a single fade doesn't swing the cost.
 	  4. FEATURE: meshPacket_printRoutingTable() now has a "Cost" column and the "Route changed" debug message prints the old and new cost.
 	  5. CHORE: Debug message "Packet received: ..." now also prints the packet TTL and the MAC address of the transmitting neighbour (helps diagnosing route learning).
-	  6.
+	  6. CHORE: README.md updated to match the code. Fixed stale statements: retransmission claim (library does not resend unACKed packets yet), route expiry (15 min),
+			"fastest win" route learning (now cost-based), maximum payload (239 bytes) and library size (~470 lines).
+	  7. CHORE: README.md now has "Route Selection", "Configuration" (compile-time defines) and "Limitations" sections, and describes beacon / flood behaviour.
+	  8.
 
 */
 

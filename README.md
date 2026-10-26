@@ -11,7 +11,7 @@ In a large, remote house where tinkerers live, managing multiple custom IoT proj
 
 This boils down to the following requirements:
 
-* Small footprint: The library is ~600 lines of code (it could be smaller), with a protocol overhead of just 11 bytes (also potentially reducible).
+* Small footprint: The library is ~470 lines of code (it could be smaller), with a protocol overhead of just 11 bytes (also potentially reducible).
 * Portability: It requires very little change.
 * Multi-interface support: It must support multiple communication interfaces. (user-defined `meshPacket_OnDataRecv` and `meshPacket_OnDataSent` functions).
 
@@ -21,10 +21,12 @@ This boils down to the following requirements:
 - [Features](#features)
 - [How Does It Work](#How-Does-It-Work)
   - [Route Discovery](#Route-Discovery)
+  - [Route Selection](#Route-Selection)
   - [Mesh Hopping](#Mesh-Hopping)
   - [Safety Mechanisms](#Safety-Mechanisms)
   - [Route Aging](#Route-Aging)
 - [Installation](#installation)
+- [Configuration](#configuration)
 - [Getting Started](#getting-started)
   - [Initialize the Mesh](#1-initialize-the-mesh)
   - [Define Message Handler](#2-define-message-handler-(optional))
@@ -32,19 +34,21 @@ This boils down to the following requirements:
   - [Handle Incoming Packets](#4-handle-incoming-packets)
   - [Sending a Message](#5-sending-a-message)
   - [Sending a Beacon](#6-sending-a-beacon)
+- [Limitations](#limitations)
 - [License & Author](#license--author)
 - [TODO](#todo)
 ---
 
 ## Features
 - Multi-hop routing via ESP-NOW (default)
+- Cost-based route selection (hops + RSSI link penalty) with hysteresis and RSSI smoothing
 - Automatic route aging and management
-- Flood routing via beacon for better route discovery
-- ACK-based delivery reliability
+- Flood routing via beacon for better route discovery (route request / route reply)
+- End-to-end ACK packets (delivery confirmation; see [Limitations](#limitations), no library-level retries yet)
 - Duplicate packet suppression
-- Peer table and routing table management
+- Automatic ESP-NOW peer management (peers added on first use, pruned when no route uses them)
 - Packet queueing (FreeRTOS)
-- User-defined packet handler callback
+- User-defined packet handler and message handler callbacks
 - Very low overhead – designed for IoT nodes
 ---
 
@@ -65,7 +69,10 @@ struct __attribute__((packed)) meshPacket_t
 };
 ```
 
-The whole header consists of 11 bytes, suitable for embedded systems like ESP32. The maximum payload size is 244 bytes. 
+The whole header consists of 11 bytes, suitable for embedded systems like ESP32. The maximum payload size is 239 bytes (ESP-NOW limit of 250 bytes minus the header). The `reserved` field is currently unused.
+
+Reserved device IDs: `DEVICE_ID_DATABASE` (250), `DEVICE_ID_BROADCAST` (254) and `DEVICE_ID_UNCONFIGURED` (255). Routes to broadcast and unconfigured IDs are never learned.
+Packet types: `TELEMETRY` (0), `CONTROL` (1), `NOTIFICATION` (2), `ACKNOWLEDGEMENT` (100), `BEACON` (101).
 
 ### Route Discovery
 ![screenshot](images/routeDiscovery.png) \
@@ -76,23 +83,40 @@ Intermediate nodes (ex., Node 01) receive the broadcast packet. If the packet is
 The intended recipient (D02) receives the packet, fires a callback and sends an ACK back to the source. This ACK also travels along a learned reverse path, reinforcing the direct connection.
 
 ![screenshot](images/sendToNode.png) \
-Once a route (or its reverse) is learned, Next time S00-D02-T01 packet is transmitted direct path is used, significantly improving efficiency. Additionally, ESP-NOW packet retransmission is handled internally by the library. The packet is resent for up to 10 times. 
+Once a route (or its reverse) is learned, next time S00-D02-T01 packet is transmitted direct path is used, significantly improving efficiency. Unicast next hops are registered as ESP-NOW peers on first use, so the ESP-NOW link layer retries each hop. If there is no route (or the peer table is full) the packet falls back to broadcast flooding. Note that the library itself does not yet retransmit packets whose end-to-end ACK never arrives (see [Limitations](#limitations)).
+
+**Beacons.** `meshPacket_sendBeacon(..)` floods a broadcast beacon. Every configured node that receives it handles it locally *and* forwards it, so it reaches multi-hop neighbours. Configured nodes answer with an ACK (source = first entry of `acceptedDeviceIDs`), which travels back along the reverse path and teaches every node on the way a route to the responder. Unconfigured devices (`DEVICE_ID_UNCONFIGURED`) forward beacons but never ACK them. Other broadcast packets are not ACKed.
+
+### Route Selection
+Each route stores the next-hop MAC, the hop count (derived from TTL), and a smoothed RSSI. Routes are compared by cost:
+
+```
+cost = hops * MESH_PACKET_COST_PER_HOP + link penalty
+```
+
+The link penalty grows linearly from 0 (RSSI at or above `MESH_LINK_RSSI_GOOD_DBM`, default -80 dBm) to `MESH_LINK_MAX_PENALTY` (RSSI at or below `MESH_LINK_RSSI_POOR_DBM`, default -95 dBm). Rules:
+
+* A different next hop replaces the current route only if its cost is lower by more than `MESH_PACKET_ROUTE_COST_HYSTERESIS` (default 5). This avoids route flapping.
+* Packets arriving via a worse alternative do not refresh `lastSeen`, so a dead best route can still expire.
+* When a route is refreshed through the same next hop, the stored RSSI is smoothed (3/4 old + 1/4 new), so a single fade does not swing the cost.
+* NOTE: RSSI only describes the last hop's link, not the whole path.
 
 ### Mesh Hopping
 ![screenshot](images/meshHopping.png) \
 A mesh network wouldn't be complete without hopping. The above example shows initial transmission with more nodes than in the previous example. By following the logic described in **Route Discovery** section it can be seen
 how S00-D03 message is sent and ACK is received. This example is important to show to understand a few important points.
 
-Backward routes are learned based on "fastest win" meaning protocol doesn't optimize the routes once they are established. 
+Backward routes are learned from the first packet that arrives, but they are re-evaluated as more packets come in: a cheaper path (see [Route Selection](#route-selection)) replaces the current one once it beats it by the hysteresis margin.
 
 ### Safety Mechanisms
 Since, a fallback transmission rely on broadcasting duplicate messages cannot be avoided in congested areas. To manage this, the protocol stores a `uniqueIdentifier` in each packet header.
-When a device receives a packet, it checks the `uniqueIdentifier` and `sourceID`. If a match is found, the packet is dropped to prevent duplicates. Unique processed packets are remembered (table size is 25 entries). \
-Additionally, the packet header includes a TTL (Time To Live), borrowed from the TCP/IP protocol. This parameter controls the maximum number of hops a packet can have. Each time the packet is routed, the TTL is decremented (default set to 5). This mechanism helps optimize route discovery and prevents potential routing loops. \
+When a device receives a packet, it checks the `uniqueIdentifier` and `sourceID`. If a match is found, the packet is dropped to prevent duplicates. Unique processed packets are remembered (table size is 25 entries, oldest overwritten first). \
+Additionally, the packet header includes a TTL (Time To Live), borrowed from the TCP/IP protocol. This parameter controls the maximum number of hops a packet can have. Each time the packet is routed, the TTL is decremented (default `MESH_PACKET_HOP_LIMIT` is 5). This mechanism helps optimize route discovery and prevents potential routing loops. \
 To mitigate network saturation in heavily congested areas, flood control is implemented by introducing slight random delays before forwarding packets. Each packet experiences a delay of 1 to 5 milliseconds, reducing the chances of collision and/or broadcast storms.
 
 ### Route Aging
-To prevent stale nodes from sabotaging the network, route aging is used. Each device's routing table includes a `lastSeen` timestamp, which is updated every time a packet from a node is received. If no packets are received from a particular node for longer than the default duration of 10 minutes, that route is considered stale and is removed from the routing table.
+To prevent stale nodes from sabotaging the network, route aging is used. Each device's routing table includes a `lastSeen` timestamp, which is updated every time a packet from a node is received via the current next hop. If no packets are received from a particular node for longer than `MESH_PACKET_NODE_EXPIRE_TIME_MS` (default 15 minutes), that route is considered stale and is removed from the routing table. ESP-NOW peers that no remaining route uses are then removed too.
+Note that a failed delivery does not invalidate a route; only expiry does.
 
 ---
 
@@ -105,6 +129,28 @@ Documents/Arduino/libraries/meshProtocol/
 ```
 
 3. Restart Arduino IDE
+---
+
+## Configuration
+
+Compile-time options in `meshProtocol.h`:
+
+| Define | Default | Meaning |
+|---|---|---|
+| `ENABLE_DEBUG_MESSAGES` | enabled | Debug messages via `meshPacket_messageHandler(..)`. Comment out for production. |
+| `MESH_PACKET_MAX_ROUTES` | 30 | Routing table size (max 255). |
+| `MESH_PACKET_CACHE_SIZE` | 25 | Seen-packet cache size (max 255). |
+| `MESH_PACKET_HOP_LIMIT` | 5 | Initial TTL. |
+| `MESH_PACKET_QUEUE_LENGTH` | 36 | RX queue length. |
+| `MESH_PACKET_PENDING_ACKS` | 20 | Pending ACK slots. |
+| `MESH_PACKET_NODE_EXPIRE_TIME_MS` | 900000 | Route timeout (15 min). |
+| `MESH_PACKET_ROUTE_COST_HYSTERESIS` | 5 | Cost margin required to replace a route. |
+| `MESH_PACKET_COST_PER_HOP` | 10 | Cost of one hop. |
+| `MESH_LINK_RSSI_GOOD_DBM` / `MESH_LINK_RSSI_POOR_DBM` | -80 / -95 | RSSI range of the link penalty. Retune per radio. |
+| `MESH_LINK_MAX_PENALTY` | 25 | Maximum link penalty. |
+| `MAX_PEERS` | 20 | ESP-NOW peer limit. |
+| `MAX_IOT_DEVICES` | 128 | Devices tracked by `meshPacket_getActiveDeviceCount(..)` (max 255). |
+
 ---
 
 ## Getting Started
@@ -187,6 +233,19 @@ meshPacket_sendBeacon(LOCAL_DEVICE_ID);
 
 ---
 
+## Limitations
+
+* **No library-level retransmission.** ACKs are tracked, but unacknowledged packets are not resent (`checkRetransmissions()` is not finished). Reliability relies on ESP-NOW link-layer retries for unicast; broadcast fallback has none. Applications that need guaranteed delivery must retry themselves.
+* **Slow failover.** A failed unicast does not drop its route; the route only disappears after `MESH_PACKET_NODE_EXPIRE_TIME_MS`.
+* **Not confirmed to be thread-safe.** Routing table, cache and pending-ACK table are not protected by locks. Call the library from one task.
+* **No security.** Packets and peers are unencrypted and `sourceID` is not authenticated, so a foreign device on the same channel can spoof nodes or poison routes.
+* **RSSI is per-hop.** Route cost uses the last hop's RSSI only.
+* **All nodes relay.** There is no sleeping/non-relaying node mode.
+* **Beacon replies** use only the first entry of `acceptedDeviceIDs` as the source ID.
+* The 25-entry seen-cache and 16-bit UIDs can wrap on very busy networks, letting stale duplicates through.
+
+---
+
 ## License & Author
 
 MIT / Beerware.
@@ -198,5 +257,11 @@ If you find this useful, buy the author a beer 🍺 :) \
 
 ## TODO
 
-To do's right now are inside .h file. Will move to README.md at some point.
+Detailed to do's are inside the .h file. Highlights:
+
+- Finish ACK-driven retransmission and drop the route after a failed unicast.
+- Add locking (semaphores) around shared tables.
+- Optional authentication/encryption using the `reserved` header field.
+- User-configurable `meshPacket_OnDataRecv` / `meshPacket_OnDataSent` for non-ESP-NOW interfaces.
+- Benchmark statistics.
 
