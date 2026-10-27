@@ -142,16 +142,16 @@ static const uint8_t *meshPacket_nextHop(uint8_t destID, int *routeIdx = NULL)
   return mac;
 }
 
-//- Cost of a path: hops plus a penalty that grows linearly as the link RSSI drops from GOOD to POOR. NOTE: RSSI is only the last hop's link, not the whole path.
-static uint16_t meshPacket_pathCost(uint8_t hops, int8_t rssi)
+//- Cost of ONE link: a fixed hop cost plus a penalty that grows linearly as the link RSSI drops from GOOD to POOR. The path cost is the sum of these, carried in meshPacket_t.pathCost.
+static uint8_t meshPacket_linkCost(int8_t rssi)
 {
   int16_t penalty = ((int16_t)MESH_LINK_RSSI_GOOD_DBM - rssi) * MESH_LINK_MAX_PENALTY / (MESH_LINK_RSSI_GOOD_DBM - MESH_LINK_RSSI_POOR_DBM);
   if(penalty < 0) penalty = 0;
   if(penalty > MESH_LINK_MAX_PENALTY) penalty = MESH_LINK_MAX_PENALTY;
-  return (uint16_t)hops * MESH_PACKET_COST_PER_HOP + penalty;
+  return (uint8_t)(MESH_PACKET_COST_PER_HOP + penalty);
 }
 
-esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops, bool allowCreate)
+esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops, uint8_t cost, bool allowCreate)
 {
   if(destID == DEVICE_ID_BROADCAST || destID == DEVICE_ID_UNCONFIGURED) return ESP_ERR_INVALID_ARG; //- Never learn routes to reserved IDs (would hijack broadcast/beacon sends, which look up routes by destinationID).
 
@@ -159,18 +159,22 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
   if(idx < 0 && !allowCreate) return ESP_OK; //- Duplicate copies may only refresh/replace an existing route, never create one (an echo of our own forward could create a loop).
   bool newRoute = (idx < 0); //- Result is -1 if no route exists. Keep this value as it can change later (free slot can be assigned).
   int8_t storedRSSI = RSSI;
+  uint8_t storedCost = cost;
   if(idx >= 0) //- Route exists: refresh it, or replace it only if the new path is clearly cheaper.
   {
     bool sameNextHop = (memcmp(routingTable[idx].nextHopMAC, nextHopMAC, 6) == 0);
-    uint16_t currentCost = meshPacket_pathCost(routingTable[idx].hops, routingTable[idx].lastRSSI);
-    uint16_t newCost = meshPacket_pathCost(hops, RSSI);
-    bool betterPath = (newCost + MESH_PACKET_ROUTE_COST_HYSTERESIS < currentCost);
+    uint8_t currentCost = routingTable[idx].cost;
+    bool betterPath = ((uint16_t)cost + MESH_PACKET_ROUTE_COST_HYSTERESIS < currentCost);
     if(!sameNextHop && !betterPath) return ESP_OK; //- Keep current route. Don't refresh lastSeen, so a dead best route can still expire.
 
-    if(sameNextHop) storedRSSI = (int8_t)((routingTable[idx].lastRSSI * 3 + RSSI) / 4); //- Smooth RSSI on the same link, so a single fade doesn't swing the cost.
+    if(sameNextHop) //- Smooth RSSI and cost on the same link, so a single fade doesn't swing the cost.
+    {
+      storedRSSI = (int8_t)((routingTable[idx].lastRSSI * 3 + RSSI) / 4);
+      storedCost = (uint8_t)(((uint16_t)currentCost * 3 + cost) / 4);
+    }
 
     #ifdef ENABLE_DEBUG_MESSAGES
-    if(!sameNextHop) meshPacket_sendTerminalMessage("[MESH][INFO]: Route to D%02d changed (%d hops, cost %u -> %d hops, cost %u)\n", destID, routingTable[idx].hops, currentCost, hops, newCost);
+    if(!sameNextHop) meshPacket_sendTerminalMessage("[MESH][INFO]: Route to D%02d changed (%d hops, cost %u -> %d hops, cost %u)\n", destID, routingTable[idx].hops, currentCost, hops, cost);
     #endif
   }
   else //- No existing route, try to allocate a new slot.
@@ -193,6 +197,7 @@ esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t 
   routingTable[idx].lastSeen = millis();
   routingTable[idx].lastRSSI = storedRSSI;
   routingTable[idx].hops = hops;
+  routingTable[idx].cost = storedCost;
   memcpy(routingTable[idx].nextHopMAC, nextHopMAC, 6);
 
   #ifdef ENABLE_DEBUG_MESSAGES
@@ -358,6 +363,7 @@ esp_err_t meshPacket_sendMessage(uint8_t sourceID, uint8_t destinationID, uint8_
   if(payloadLength > MAXIMUM_PACKET_LENGTH - MESH_PACKET_HEADER_LENGTH) return ESP_ERR_INVALID_ARG; //- Return error.
 
   meshPacket_t sendPacket;
+  memset(&sendPacket, 0, MESH_PACKET_HEADER_LENGTH); //- pathCost = 0 at the source, reserved bytes zeroed.
   sendPacket.sourceID = sourceID;
   sendPacket.destinationID = destinationID;
   sendPacket.packetType = packetType;
@@ -443,6 +449,15 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
 
     //- Learn reverse route: "to reach S, forward via MAC". NOTE: Runs for EVERY copy (also duplicates), before the packet is retransmitted (which decrements TTL; a direct neighbour sees TTL == HOP_LIMIT -> 1 hop).
     uint8_t hops = (receivedPacket->TTL <= MESH_PACKET_HOP_LIMIT) ? (MESH_PACKET_HOP_LIMIT - receivedPacket->TTL + 1) : 1; //- Clamp bogus TTL (ex., TTL is higher than MESH_PACKET_HOP_LIMIT).
+    //- Cost of the path to the source, ending on the link this copy arrived on. Carried cost is clamped to what is possible for this hop count (garbage / spoofed / older FW).
+    uint16_t minCost = (uint16_t)(hops - 1) * MESH_PACKET_COST_PER_HOP; //- Every earlier hop costs at least this much.
+    uint16_t maxCost = (uint16_t)(hops - 1) * MESH_LINK_MAX_COST;       //- ...and at most this much.
+    uint16_t carriedCost = receivedPacket->pathCost;
+    if(carriedCost < minCost) carriedCost = minCost; //- A forwarder did not add its link (older FW).
+    if(carriedCost > maxCost) carriedCost = minCost; //- Impossible value: fall back to the hop count.
+    uint16_t totalCost = carriedCost + meshPacket_linkCost(localQueuePacket.RSSI);
+    uint8_t pathCost = (totalCost > 255) ? 255 : (uint8_t)totalCost;
+
     bool sourceIsMe = false; //- Never learn a route to ourselves (e.g. a stale echo of our own packet after the seen-cache wrapped).
     for(uint8_t i = 0; i < acceptedDeviceCount; i++) if(receivedPacket->sourceID == acceptedDeviceIDs[i]) sourceIsMe = true;
 
@@ -451,8 +466,8 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
 
     if(!sourceIsMe)
     {
-      if(!duplicate) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops, true);
-      else if(receivedPacket->TTL + 1 >= meshPacketCache[seenIdx].TTL) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops, false); //- Only copies at most 1 hop longer than the first copy count; this rules out our own forwarded packet echoed back by a neighbour (TTL - 2).
+      if(!duplicate) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops, pathCost, true);
+      else if(receivedPacket->TTL + 1 >= meshPacketCache[seenIdx].TTL) meshPacket_routeAdd(receivedPacket->sourceID, localQueuePacket.MAC, localQueuePacket.RSSI, hops, pathCost, false); //- Only copies at most 1 hop longer than the first copy count; this rules out our own forwarded packet echoed back by a neighbour (TTL - 2).
     }
     if(duplicate) continue; //- Everything below (callback, ACK, forwarding) still runs once per packet.
 
@@ -513,6 +528,7 @@ void meshPacket_processPackets(uint8_t *acceptedDeviceIDs, uint8_t acceptedDevic
       meshPacket_sendTerminalMessage("[MESH][INFO]: Routed to D%02d / MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", (idx >= 0) ? routingTable[idx].destinationID : DEVICE_ID_BROADCAST, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       #endif
 
+      receivedPacket->pathCost = pathCost; //- Next node adds its own incoming link on top of this.
       meshPacket_retransmitPacket(receivedPacket, mac);
     }
   }
@@ -561,7 +577,7 @@ void meshPacket_printRoutingTable()
         routingTable[i].inUse ? "Yes" : "No",
         routingTable[i].lastRSSI,
         routingTable[i].hops,
-        meshPacket_pathCost(routingTable[i].hops, routingTable[i].lastRSSI));
+        routingTable[i].cost);
     }
   }
   meshPacket_sendTerminalMessage("==================================================================================\n");

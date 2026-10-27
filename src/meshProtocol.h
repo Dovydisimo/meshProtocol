@@ -1,4 +1,4 @@
-/*
+﻿/*
                             meshProtocol.h - Library for meshing ESP32 devices via ESP-NOW.
                                          Created by Dovydas Bružas, 2025 July 31.
                                             Released into the public domain.
@@ -18,14 +18,12 @@
 	  12. Įdėti thread palaikymą. Paleisti atskirą thread'ą _init metu? 
 	  15. FEATURE: Failed unicast (after retransmission) should drop the routing table.
 	  16. Decide how to handle retransmissions (leave it to USER like <1.7.0 or handle it in library like >=1.8.0).
-	  17. FEATURE: Accumulated path cost in the packet header. Use a byte of meshPacket_t "reserved" (currently NOT initialised in meshPacket_sendMessage(..), so it must be zeroed and all nodes
-			reflashed). Every forwarder adds the cost of the link it received the packet on (MESH_PACKET_COST_PER_HOP + RSSI penalty) before retransmitting, the receiver adds its last link.
-			Fits uint8_t (about 210 max). Fixes "RSSI describes only the last hop" and makes the cost transport independent (ESP-NOW + LoRa E28-2G4T27S), as every hop converts its own RSSI.
 	  18. FEATURE: Route staleness term in the cost (frozen lastRSSI makes a dead good link look great; must be longer than the slowest device's packet interval) and an "unusable link" floor
 			(RSSI penalty currently saturates at MESH_LINK_RSSI_POOR_DBM).
 	  19. FEATURE: Link asymmetry: RSSI shows how loud a neighbour is, not how well it hears us (high TX power nodes like E28-2G4T27S). Carry TX power in the header, or demote routes
 			when ACKs are missing (there are no MAC level ACKs / OnDataSent feedback on LoRa).
-	  20.
+	  20. CHORE: Remove the pathCost clamp in meshPacket_processPackets(..) (minCost / maxCost / carriedCost) once all devices run v1.9.0 or newer (it only protects against garbage from older FW) and use receivedPacket->pathCost directly.
+	  21.
   
 */
 
@@ -68,6 +66,8 @@
 #define MESH_LINK_MAX_PENALTY             		25     //- Maximum link penalty (2.5 hops worth).
 #endif
 static_assert(MESH_LINK_RSSI_GOOD_DBM > MESH_LINK_RSSI_POOR_DBM, "ERROR: MESH_LINK_RSSI_GOOD_DBM must be higher than MESH_LINK_RSSI_POOR_DBM!");
+#define MESH_LINK_MAX_COST                		(MESH_PACKET_COST_PER_HOP + MESH_LINK_MAX_PENALTY) //- Worst cost of a single link.
+static_assert((MESH_PACKET_HOP_LIMIT + 1) * MESH_LINK_MAX_COST <= 255, "ERROR: Worst case path cost does not fit meshPacket_t.pathCost (uint8_t)!");
 
 
 //----------------- SERVICE DEVICES -----------------//
@@ -93,7 +93,8 @@ struct __attribute__((packed)) meshPacket_t
   uint8_t payloadLength;
   uint8_t TTL;
   uint16_t uniqueIdentifier;
-  uint32_t reserved;
+  uint8_t pathCost;           //- Cost of the path travelled so far, up to the node that last transmitted the packet. Source sends 0, every receiver adds its incoming link.
+  uint8_t reserved[3];
   char payload[MAXIMUM_PACKET_LENGTH - MESH_PACKET_HEADER_LENGTH];
 };
 
@@ -119,7 +120,8 @@ struct __attribute__((packed)) routingTable_t
     uint8_t nextHopMAC[6];      //- MAC of the next hop.
     uint32_t lastSeen;          //- millis() timestamp for aging.
     int8_t lastRSSI;			//- Last RSSI received.
-	uint8_t hops;               //- Hops to destination via nextHopMAC (1 = direct neighbour).
+	uint8_t hops;               //- Hops to destination via nextHopMAC (1 = direct neighbour). Display only, routing uses "cost".
+    uint8_t cost;               //- Accumulated path cost to destinationID via nextHopMAC. Lower is better.
 };
 
 struct __attribute__((packed)) PendingAck_t
@@ -134,7 +136,7 @@ struct __attribute__((packed)) PendingAck_t
 //========================================= FUNCTION PROTOTYPES ==============================================//
 esp_err_t meshPacket_init(uint8_t wifiChannel);
 int meshPacket_routeFind(uint8_t destID);
-esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops, bool allowCreate = true);
+esp_err_t meshPacket_routeAdd(uint8_t destID, const uint8_t *nextHopMAC, int8_t RSSI, uint8_t hops, uint8_t cost, bool allowCreate = true);
 void meshPacket_routeAge();
 void meshPacket_rememberPacket(uint8_t sourceID, uint16_t uniqueIdentifier, uint8_t TTL = MESH_PACKET_HOP_LIMIT);
 int meshPacket_findSeenPacket(uint8_t sourceID, uint16_t uniqueIdentifier);
@@ -281,19 +283,16 @@ void meshPacket_sendTerminalMessage(const char *format, ...) __attribute__((form
 				---	2026-10-26	---
 				  --- v1.9.0 ---
 
-	  1. FEATURE: Route selection uses a cost instead of "fewer hops always wins". NOTE: RSSI describes only the last hop's link, not the whole path.
-	  2. CHORE: MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB replaced by MESH_PACKET_ROUTE_COST_HYSTERESIS. An alternative route must be cheaper than the current one by this much to replace it.
-	  3. FEATURE: RSSI stored in a route is smoothed (3/4 old + 1/4 new) when the route is refreshed through the same next hop, so a single fade doesn't swing the cost.
-	  4. FEATURE: meshPacket_printRoutingTable() now has a "Cost" column and the "Route changed" debug message prints the old and new cost.
-	  5. CHORE: Debug message "Packet received: ..." now also prints the packet TTL and the MAC address of the transmitting neighbour (helps diagnosing route learning).
-	  6. CHORE: README.md updated to match the code. Fixed stale statements: retransmission claim (library does not resend unACKed packets yet), route expiry (15 min),
-			"fastest win" route learning (now cost-based), maximum payload (239 bytes) and library size (~470 lines).
-	  7. CHORE: README.md now has "Route Selection", "Configuration" (compile-time defines) and "Limitations" sections, and describes beacon / flood behaviour.
-	  8. FEATURE: Routes are now learned from every received copy of a packet, not only the first one. Duplicate copies can only refresh or replace an existing route (never create one).
-	  9. CHORE: meshPacketCache_t stores the TTL of the first copy. New meshPacket_findSeenPacket(..) returns the cache index. meshPacket_rememberPacket(..) takes a TTL argument (default
-			MESH_PACKET_HOP_LIMIT) and meshPacket_routeAdd(..) takes an "allowCreate" argument (default true).
-	  10. CHORE: Route learning now runs before the packet callback, so a reply sent from inside the callback (ex., gateway answering a beacon) can already use the learned route.
-	  11.
+	  1. FEATURE: Route selection uses an end-to-end path cost (sum of link costs: MESH_PACKET_COST_PER_HOP + RSSI penalty) instead of "fewer hops always wins".
+			Replacing a route needs a cost lower by MESH_PACKET_ROUTE_COST_HYSTERESIS (replaces MESH_PACKET_ROUTE_RSSI_HYSTERESIS_DB). Cost and RSSI are smoothed (3/4 old + 1/4 new) on refresh.
+	  2. FEATURE: Accumulated path cost in the packet header. "reserved" (uint32_t) replaced with "pathCost" (uint8_t) + reserved[3], header is still 11 bytes and is now zeroed in meshPacket_sendMessage(..).
+	  3. CHORE: routingTable_t has a new "cost" field, meshPacket_routeAdd(..) takes "cost" and "allowCreate" arguments. "hops" and RSSI are display only.
+	  4. FEATURE: Routes are learned from every received copy of a packet. Duplicate copies can only refresh or replace a route (never create one). meshPacketCache_t stores the first copy's TTL,
+			new meshPacket_findSeenPacket(..), meshPacket_rememberPacket(..) takes a TTL argument.
+	  5. CHORE: Route learning runs before the packet callback, so a reply sent from inside it (ex., gateway answering a beacon) can already use the learned route.
+	  6. FEATURE: Routing table has a "Cost" column, "Route changed" prints old/new cost, "Packet received" debug message prints TTL and the MAC of the transmitting neighbour.
+	  7. CHORE: README.md updated to match the code, new "Route Selection", "Configuration" and "Limitations" sections.
+	  8.
 
 */
 

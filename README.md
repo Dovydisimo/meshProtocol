@@ -41,7 +41,7 @@ This boils down to the following requirements:
 
 ## Features
 - Multi-hop routing via ESP-NOW (default)
-- Cost-based route selection (hops + RSSI link penalty) with hysteresis and RSSI smoothing
+- Cost-based route selection (accumulated path cost carried in the header) with hysteresis and smoothing
 - Automatic route aging and management
 - Flood routing via beacon for better route discovery (route request / route reply)
 - End-to-end ACK packets (delivery confirmation; see [Limitations](#limitations), no library-level retries yet)
@@ -64,12 +64,13 @@ struct __attribute__((packed)) meshPacket_t
   uint8_t payloadLength;
   uint8_t TTL;
   uint16_t uniqueIdentifier;
-  uint32_t reserved;
+  uint8_t pathCost;
+  uint8_t reserved[3];
   char payload[244];
 };
 ```
 
-The whole header consists of 11 bytes, suitable for embedded systems like ESP32. The maximum payload size is 239 bytes (ESP-NOW limit of 250 bytes minus the header). The `reserved` field is currently unused.
+The whole header consists of 11 bytes, suitable for embedded systems like ESP32. The maximum payload size is 239 bytes (ESP-NOW limit of 250 bytes minus the header). `pathCost` carries the accumulated route cost (see Route Selection); the `reserved` bytes are currently unused.
 
 Reserved device IDs: `DEVICE_ID_DATABASE` (250), `DEVICE_ID_BROADCAST` (254) and `DEVICE_ID_UNCONFIGURED` (255). Routes to broadcast and unconfigured IDs are never learned.
 Packet types: `TELEMETRY` (0), `CONTROL` (1), `NOTIFICATION` (2), `ACKNOWLEDGEMENT` (100), `BEACON` (101).
@@ -88,18 +89,19 @@ Once a route (or its reverse) is learned, next time S00-D02-T01 packet is transm
 **Beacons.** `meshPacket_sendBeacon(..)` floods a broadcast beacon. Every configured node that receives it handles it locally *and* forwards it, so it reaches multi-hop neighbours. Configured nodes answer with an ACK (source = first entry of `acceptedDeviceIDs`), which travels back along the reverse path and teaches every node on the way a route to the responder. Unconfigured devices (`DEVICE_ID_UNCONFIGURED`) forward beacons but never ACK them. Other broadcast packets are not ACKed.
 
 ### Route Selection
-Each route stores the next-hop MAC, the hop count (derived from TTL), and a smoothed RSSI. Routes are compared by cost:
+Each route stores the next-hop MAC, the accumulated path cost, and (for display) the hop count derived from TTL and a smoothed last-hop RSSI. The source sends `pathCost = 0`; every node that receives a packet adds the cost of the link it arrived on and forwards the packet with the new value:
 
 ```
-cost = hops * MESH_PACKET_COST_PER_HOP + link penalty
+link cost = MESH_PACKET_COST_PER_HOP + link penalty
+path cost = sum of the link costs from the source to this node
 ```
 
-The link penalty grows linearly from 0 (RSSI at or above `MESH_LINK_RSSI_GOOD_DBM`, default -80 dBm) to `MESH_LINK_MAX_PENALTY` (RSSI at or below `MESH_LINK_RSSI_POOR_DBM`, default -95 dBm). Rules:
+Every hop converts its own RSSI into a cost, so only the cost travels in the packet (transport independent). A received `pathCost` is clamped to what is possible for the packet's hop count. The link penalty grows linearly from 0 (RSSI at or above `MESH_LINK_RSSI_GOOD_DBM`, default -80 dBm) to `MESH_LINK_MAX_PENALTY` (RSSI at or below `MESH_LINK_RSSI_POOR_DBM`, default -95 dBm). Rules:
 
 * A different next hop replaces the current route only if its cost is lower by more than `MESH_PACKET_ROUTE_COST_HYSTERESIS` (default 5). This avoids route flapping.
 * Packets (and duplicate copies) arriving via a worse alternative do not refresh `lastSeen`, so a dead best route can still expire.
-* When a route is refreshed through the same next hop, the stored RSSI is smoothed (3/4 old + 1/4 new), so a single fade does not swing the cost.
-* NOTE: RSSI only describes the last hop's link, not the whole path.
+* When a route is refreshed through the same next hop, the stored RSSI and cost are smoothed (3/4 old + 1/4 new), so a single fade does not swing the cost.
+* All nodes must run a version with `pathCost` (v1.9.0+); older firmware does not add link costs.
 
 ### Mesh Hopping
 ![screenshot](images/meshHopping.png) \
@@ -240,7 +242,7 @@ meshPacket_sendBeacon(LOCAL_DEVICE_ID);
 * **Slow failover.** A failed unicast does not drop its route; the route only disappears after `MESH_PACKET_NODE_EXPIRE_TIME_MS`.
 * **Not confirmed to be thread-safe.** Routing table, cache and pending-ACK table are not protected by locks. Call the library from one task.
 * **No security.** Packets and peers are unencrypted and `sourceID` is not authenticated, so a foreign device on the same channel can spoof nodes or poison routes.
-* **RSSI is per-hop.** Route cost uses the last hop's RSSI only.
+* **Cost is a snapshot.** Link RSSI is measured when a packet arrives and is not aged, so a link that went silent keeps its last cost until the route expires. RSSI shows how loud a neighbour is, not how well it hears us (asymmetric links).
 * **All nodes relay.** There is no sleeping/non-relaying node mode.
 * **Beacon replies** use only the first entry of `acceptedDeviceIDs` as the source ID.
 * The 25-entry seen-cache and 16-bit UIDs can wrap on very busy networks, letting stale duplicates through.
